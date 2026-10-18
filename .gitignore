@@ -1,0 +1,43 @@
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+deploy/production/.env
+deploy/production/.env.node
+!deploy/production/.env.example
+!deploy/production/.env.node.example
+
+# Internal project documentation, kept outside the public repository
+docs/
+Политика-конфиденциальности.txt
+Пользовательское-соглашение.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Test and type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Runtime data and generated files
+*.sqlite
+*.sqlite3
+*.db
+*.log
+.panel-index.tmp.js
+
+# Editors and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
