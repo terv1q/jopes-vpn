@@ -1,0 +1,908 @@
+{
+  "currency": "XTR",
+  "plans": [
+    {
+      "code": "lite-1",
+      "panel_tag": "PLAN_LITE_1",
+      "title": "Лайт · 2 ГБ",
+      "days": 7,
+      "description": "2 ГБ на весь срок, без переноса и сброса лимита",
+      "price_minor": 10,
+      "traffic_limit_gb": 2,
+      "traffic_limit_strategy": "NO_RESET",
+      "terms": [
+        {
+          "days": 7,
+          "price_rub_minor": 1066,
+          "stars_amount": 10,
+          "stars_rub_equivalent_minor": 1254
+        },
+        {
+          "days": 15,
+          "price_rub_minor": 2239,
+          "stars_amount": 21,
+          "stars_rub_equivalent_minor": 2634
+        },
+        {
+          "days": 30,
+          "price_rub_minor": 4264,
+          "stars_amount": 40,
+          "stars_rub_equivalent_minor": 5017
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 12260,
+          "stars_amount": 115,
+          "stars_rub_equivalent_minor": 14424
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 23242,
+          "stars_amount": 218,
+          "stars_rub_equivalent_minor": 27343
+        }
+      ]
+    },
+    {
+      "code": "week-5",
+      "panel_tag": "PLAN_WEEK_5",
+      "title": "Неделя · 1 ГБ",
+      "days": 7,
+      "description": "До 1 ГБ за календарную неделю, сброс по расписанию Panel",
+      "price_minor": 3,
+      "traffic_limit_gb": 1,
+      "traffic_limit_strategy": "WEEK",
+      "terms": [
+        {
+          "days": 7,
+          "price_rub_minor": 320,
+          "stars_amount": 3,
+          "stars_rub_equivalent_minor": 376
+        },
+        {
+          "days": 15,
+          "price_rub_minor": 640,
+          "stars_amount": 6,
+          "stars_rub_equivalent_minor": 753
+        },
+        {
+          "days": 30,
+          "price_rub_minor": 1173,
+          "stars_amount": 11,
+          "stars_rub_equivalent_minor": 1380
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 3412,
+          "stars_amount": 32,
+          "stars_rub_equivalent_minor": 4014
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 6717,
+          "stars_amount": 63,
+          "stars_rub_equivalent_minor": 7902
+        }
+      ]
+    },
+    {
+      "code": "daily-2",
+      "panel_tag": "PLAN_DAILY_2",
+      "title": "День · 1 ГБ",
+      "days": 7,
+      "description": "До 1 ГБ в сутки, сброс по расписанию Panel",
+      "price_minor": 8,
+      "traffic_limit_gb": 1,
+      "traffic_limit_strategy": "DAY",
+      "terms": [
+        {
+          "days": 7,
+          "price_rub_minor": 853,
+          "stars_amount": 8,
+          "stars_rub_equivalent_minor": 1003
+        },
+        {
+          "days": 15,
+          "price_rub_minor": 1812,
+          "stars_amount": 17,
+          "stars_rub_equivalent_minor": 2132
+        },
+        {
+          "days": 30,
+          "price_rub_minor": 3412,
+          "stars_amount": 32,
+          "stars_rub_equivalent_minor": 4014
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 9808,
+          "stars_amount": 92,
+          "stars_rub_equivalent_minor": 11539
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 18550,
+          "stars_amount": 174,
+          "stars_rub_equivalent_minor": 21824
+        }
+      ]
+    },
+    {
+      "code": "month-20",
+      "panel_tag": "PLAN_MONTH_20",
+      "title": "Месяц · 2 ГБ",
+      "days": 30,
+      "description": "До 2 ГБ за календарный месяц, сброс по расписанию Panel",
+      "price_minor": 5,
+      "traffic_limit_gb": 2,
+      "traffic_limit_strategy": "MONTH",
+      "terms": [
+        {
+          "days": 30,
+          "price_rub_minor": 533,
+          "stars_amount": 5,
+          "stars_rub_equivalent_minor": 627
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 1386,
+          "stars_amount": 13,
+          "stars_rub_equivalent_minor": 1631
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 2666,
+          "stars_amount": 25,
+          "stars_rub_equivalent_minor": 3136
+        }
+      ]
+    },
+    {
+      "code": "month-50",
+      "panel_tag": "PLAN_MONTH_50",
+      "title": "Месяц · 3 ГБ",
+      "days": 30,
+      "description": "До 3 ГБ за календарный месяц, сброс по расписанию Panel",
+      "price_minor": 10,
+      "traffic_limit_gb": 3,
+      "traffic_limit_strategy": "MONTH",
+      "terms": [
+        {
+          "days": 30,
+          "price_rub_minor": 1066,
+          "stars_amount": 10,
+          "stars_rub_equivalent_minor": 1254
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 2879,
+          "stars_amount": 27,
+          "stars_rub_equivalent_minor": 3387
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 5437,
+          "stars_amount": 51,
+          "stars_rub_equivalent_minor": 6397
+        }
+      ]
+    },
+    {
+      "code": "pack-50",
+      "panel_tag": "PLAN_PACK_50",
+      "title": "Пакет · 8 ГБ",
+      "days": 15,
+      "description": "8 ГБ на весь срок, без переноса и сброса лимита",
+      "price_minor": 10,
+      "traffic_limit_gb": 8,
+      "traffic_limit_strategy": "NO_RESET",
+      "terms": [
+        {
+          "days": 15,
+          "price_rub_minor": 1066,
+          "stars_amount": 10,
+          "stars_rub_equivalent_minor": 1254
+        },
+        {
+          "days": 30,
+          "price_rub_minor": 2026,
+          "stars_amount": 19,
+          "stars_rub_equivalent_minor": 2383
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 5757,
+          "stars_amount": 54,
+          "stars_rub_equivalent_minor": 6773
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 10875,
+          "stars_amount": 102,
+          "stars_rub_equivalent_minor": 12794
+        }
+      ]
+    },
+    {
+      "code": "unlimited-7",
+      "panel_tag": "PLAN_UNLIMITED_7",
+      "title": "Безлимит",
+      "days": 7,
+      "description": "Без установленного лимита трафика на срок подписки",
+      "price_minor": 25,
+      "traffic_limit_gb": null,
+      "traffic_limit_strategy": "NO_RESET",
+      "terms": [
+        {
+          "days": 7,
+          "price_rub_minor": 2666,
+          "stars_amount": 25,
+          "stars_rub_equivalent_minor": 3136
+        },
+        {
+          "days": 15,
+          "price_rub_minor": 5330,
+          "stars_amount": 50,
+          "stars_rub_equivalent_minor": 6271
+        },
+        {
+          "days": 30,
+          "price_rub_minor": 10129,
+          "stars_amount": 95,
+          "stars_rub_equivalent_minor": 11916
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 26121,
+          "stars_amount": 245,
+          "stars_rub_equivalent_minor": 30730
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 44777,
+          "stars_amount": 420,
+          "stars_rub_equivalent_minor": 52679
+        }
+      ]
+    },
+    {
+      "code": "experiment-10",
+      "panel_tag": "PLAN_EXP_10",
+      "title": "Эксперимент · 3 ГБ в неделю",
+      "days": 14,
+      "description": "До 3 ГБ за календарную неделю, сброс по расписанию Panel",
+      "price_minor": 2,
+      "traffic_limit_gb": 3,
+      "traffic_limit_strategy": "WEEK",
+      "terms": [
+        {
+          "days": 14,
+          "price_rub_minor": 213,
+          "stars_amount": 2,
+          "stars_rub_equivalent_minor": 251
+        },
+        {
+          "days": 30,
+          "price_rub_minor": 427,
+          "stars_amount": 4,
+          "stars_rub_equivalent_minor": 502
+        },
+        {
+          "days": 60,
+          "price_rub_minor": 746,
+          "stars_amount": 7,
+          "stars_rub_equivalent_minor": 878
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 1066,
+          "stars_amount": 10,
+          "stars_rub_equivalent_minor": 1254
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 2026,
+          "stars_amount": 19,
+          "stars_rub_equivalent_minor": 2383
+        }
+      ]
+    },
+    {
+      "code": "micro-3",
+      "panel_tag": "PLAN_MICRO_3",
+      "title": "Мини · 1 ГБ",
+      "days": 7,
+      "description": "1 ГБ на весь срок, без переноса и сброса лимита",
+      "price_minor": 3,
+      "traffic_limit_gb": 1,
+      "traffic_limit_strategy": "NO_RESET",
+      "terms": [
+        {
+          "days": 7,
+          "price_rub_minor": 320,
+          "stars_amount": 3,
+          "stars_rub_equivalent_minor": 376
+        },
+        {
+          "days": 15,
+          "price_rub_minor": 640,
+          "stars_amount": 6,
+          "stars_rub_equivalent_minor": 753
+        },
+        {
+          "days": 30,
+          "price_rub_minor": 1173,
+          "stars_amount": 11,
+          "stars_rub_equivalent_minor": 1380
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 3412,
+          "stars_amount": 32,
+          "stars_rub_equivalent_minor": 4014
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 6717,
+          "stars_amount": 63,
+          "stars_rub_equivalent_minor": 7902
+        }
+      ]
+    },
+    {
+      "code": "pack-10",
+      "panel_tag": "PLAN_PACK_10",
+      "title": "Пакет · 3 ГБ",
+      "days": 7,
+      "description": "3 ГБ на весь срок, без переноса и сброса лимита",
+      "price_minor": 4,
+      "traffic_limit_gb": 3,
+      "traffic_limit_strategy": "NO_RESET",
+      "terms": [
+        {
+          "days": 7,
+          "price_rub_minor": 427,
+          "stars_amount": 4,
+          "stars_rub_equivalent_minor": 502
+        },
+        {
+          "days": 15,
+          "price_rub_minor": 853,
+          "stars_amount": 8,
+          "stars_rub_equivalent_minor": 1003
+        },
+        {
+          "days": 30,
+          "price_rub_minor": 1599,
+          "stars_amount": 15,
+          "stars_rub_equivalent_minor": 1881
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 4691,
+          "stars_amount": 44,
+          "stars_rub_equivalent_minor": 5519
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 9275,
+          "stars_amount": 87,
+          "stars_rub_equivalent_minor": 10912
+        }
+      ]
+    },
+    {
+      "code": "pack-25",
+      "panel_tag": "PLAN_PACK_25",
+      "title": "Пакет · 5 ГБ",
+      "days": 15,
+      "description": "5 ГБ на весь срок, без переноса и сброса лимита",
+      "price_minor": 6,
+      "traffic_limit_gb": 5,
+      "traffic_limit_strategy": "NO_RESET",
+      "terms": [
+        {
+          "days": 15,
+          "price_rub_minor": 640,
+          "stars_amount": 6,
+          "stars_rub_equivalent_minor": 753
+        },
+        {
+          "days": 30,
+          "price_rub_minor": 1173,
+          "stars_amount": 11,
+          "stars_rub_equivalent_minor": 1380
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 3412,
+          "stars_amount": 32,
+          "stars_rub_equivalent_minor": 4014
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 6503,
+          "stars_amount": 61,
+          "stars_rub_equivalent_minor": 7651
+        }
+      ]
+    },
+    {
+      "code": "pack-100",
+      "panel_tag": "PLAN_PACK_100",
+      "title": "Пакет · 10 ГБ",
+      "days": 30,
+      "description": "10 ГБ на весь срок, без переноса и сброса лимита",
+      "price_minor": 12,
+      "traffic_limit_gb": 10,
+      "traffic_limit_strategy": "NO_RESET",
+      "terms": [
+        {
+          "days": 30,
+          "price_rub_minor": 1279,
+          "stars_amount": 12,
+          "stars_rub_equivalent_minor": 1505
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 3412,
+          "stars_amount": 32,
+          "stars_rub_equivalent_minor": 4014
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 6503,
+          "stars_amount": 61,
+          "stars_rub_equivalent_minor": 7651
+        }
+      ]
+    },
+    {
+      "code": "week-10",
+      "panel_tag": "PLAN_WEEK_10",
+      "title": "Неделя · 2 ГБ",
+      "days": 7,
+      "description": "До 2 ГБ за календарную неделю, сброс по расписанию Panel",
+      "price_minor": 4,
+      "traffic_limit_gb": 2,
+      "traffic_limit_strategy": "WEEK",
+      "terms": [
+        {
+          "days": 7,
+          "price_rub_minor": 427,
+          "stars_amount": 4,
+          "stars_rub_equivalent_minor": 502
+        },
+        {
+          "days": 15,
+          "price_rub_minor": 853,
+          "stars_amount": 8,
+          "stars_rub_equivalent_minor": 1003
+        },
+        {
+          "days": 30,
+          "price_rub_minor": 1599,
+          "stars_amount": 15,
+          "stars_rub_equivalent_minor": 1881
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 4691,
+          "stars_amount": 44,
+          "stars_rub_equivalent_minor": 5519
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 9275,
+          "stars_amount": 87,
+          "stars_rub_equivalent_minor": 10912
+        }
+      ]
+    },
+    {
+      "code": "week-20",
+      "panel_tag": "PLAN_WEEK_20",
+      "title": "Неделя · 5 ГБ",
+      "days": 7,
+      "description": "До 5 ГБ за календарную неделю, сброс по расписанию Panel",
+      "price_minor": 8,
+      "traffic_limit_gb": 5,
+      "traffic_limit_strategy": "WEEK",
+      "terms": [
+        {
+          "days": 7,
+          "price_rub_minor": 853,
+          "stars_amount": 8,
+          "stars_rub_equivalent_minor": 1003
+        },
+        {
+          "days": 15,
+          "price_rub_minor": 1812,
+          "stars_amount": 17,
+          "stars_rub_equivalent_minor": 2132
+        },
+        {
+          "days": 30,
+          "price_rub_minor": 3412,
+          "stars_amount": 32,
+          "stars_rub_equivalent_minor": 4014
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 9808,
+          "stars_amount": 92,
+          "stars_rub_equivalent_minor": 11539
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 18550,
+          "stars_amount": 174,
+          "stars_rub_equivalent_minor": 21824
+        }
+      ]
+    },
+    {
+      "code": "daily-5",
+      "panel_tag": "PLAN_DAILY_5",
+      "title": "День · 2 ГБ",
+      "days": 7,
+      "description": "До 2 ГБ в сутки, сброс по расписанию Panel",
+      "price_minor": 12,
+      "traffic_limit_gb": 2,
+      "traffic_limit_strategy": "DAY",
+      "terms": [
+        {
+          "days": 7,
+          "price_rub_minor": 1279,
+          "stars_amount": 12,
+          "stars_rub_equivalent_minor": 1505
+        },
+        {
+          "days": 15,
+          "price_rub_minor": 2666,
+          "stars_amount": 25,
+          "stars_rub_equivalent_minor": 3136
+        },
+        {
+          "days": 30,
+          "price_rub_minor": 5117,
+          "stars_amount": 48,
+          "stars_rub_equivalent_minor": 6020
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 14713,
+          "stars_amount": 138,
+          "stars_rub_equivalent_minor": 17309
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 27933,
+          "stars_amount": 262,
+          "stars_rub_equivalent_minor": 32862
+        }
+      ]
+    },
+    {
+      "code": "daily-10",
+      "panel_tag": "PLAN_DAILY_10",
+      "title": "День · 3 ГБ",
+      "days": 30,
+      "description": "До 3 ГБ в сутки, сброс по расписанию Panel",
+      "price_minor": 50,
+      "traffic_limit_gb": 3,
+      "traffic_limit_strategy": "DAY",
+      "terms": [
+        {
+          "days": 30,
+          "price_rub_minor": 5330,
+          "stars_amount": 50,
+          "stars_rub_equivalent_minor": 6271
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 14393,
+          "stars_amount": 135,
+          "stars_rub_equivalent_minor": 16933
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 27186,
+          "stars_amount": 255,
+          "stars_rub_equivalent_minor": 31984
+        }
+      ]
+    },
+    {
+      "code": "month-10",
+      "panel_tag": "PLAN_MONTH_10",
+      "title": "Месяц · 1 ГБ",
+      "days": 30,
+      "description": "До 1 ГБ за календарный месяц, сброс по расписанию Panel",
+      "price_minor": 2,
+      "traffic_limit_gb": 1,
+      "traffic_limit_strategy": "MONTH",
+      "terms": [
+        {
+          "days": 30,
+          "price_rub_minor": 213,
+          "stars_amount": 2,
+          "stars_rub_equivalent_minor": 251
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 533,
+          "stars_amount": 5,
+          "stars_rub_equivalent_minor": 627
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 960,
+          "stars_amount": 9,
+          "stars_rub_equivalent_minor": 1129
+        }
+      ]
+    },
+    {
+      "code": "month-100",
+      "panel_tag": "PLAN_MONTH_100",
+      "title": "Месяц · 5 ГБ",
+      "days": 30,
+      "description": "До 5 ГБ за календарный месяц, сброс по расписанию Panel",
+      "price_minor": 20,
+      "traffic_limit_gb": 5,
+      "traffic_limit_strategy": "MONTH",
+      "terms": [
+        {
+          "days": 30,
+          "price_rub_minor": 2133,
+          "stars_amount": 20,
+          "stars_rub_equivalent_minor": 2509
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 5757,
+          "stars_amount": 54,
+          "stars_rub_equivalent_minor": 6773
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 10875,
+          "stars_amount": 102,
+          "stars_rub_equivalent_minor": 12794
+        }
+      ]
+    },
+    {
+      "code": "month-200",
+      "panel_tag": "PLAN_MONTH_200",
+      "title": "Месяц · 8 ГБ",
+      "days": 30,
+      "description": "До 8 ГБ за календарный месяц, сброс по расписанию Panel",
+      "price_minor": 35,
+      "traffic_limit_gb": 8,
+      "traffic_limit_strategy": "MONTH",
+      "terms": [
+        {
+          "days": 30,
+          "price_rub_minor": 3732,
+          "stars_amount": 35,
+          "stars_rub_equivalent_minor": 4390
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 10022,
+          "stars_amount": 94,
+          "stars_rub_equivalent_minor": 11790
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 18977,
+          "stars_amount": 178,
+          "stars_rub_equivalent_minor": 22326
+        }
+      ]
+    },
+    {
+      "code": "unlimited-30",
+      "panel_tag": "PLAN_UNLIM_30",
+      "title": "Безлимит · 30 дней",
+      "days": 30,
+      "description": "Без установленного лимита трафика на срок подписки",
+      "price_minor": 115,
+      "traffic_limit_gb": null,
+      "traffic_limit_strategy": "NO_RESET",
+      "sellable": false
+    },
+    {
+      "code": "unlimited-90",
+      "panel_tag": "PLAN_UNLIM_90",
+      "title": "Безлимит · 90 дней",
+      "days": 90,
+      "description": "Без установленного лимита трафика на срок подписки",
+      "price_minor": 280,
+      "traffic_limit_gb": null,
+      "traffic_limit_strategy": "NO_RESET",
+      "sellable": false
+    },
+    {
+      "code": "ultra-200",
+      "panel_tag": "PLAN_ULTRA_200",
+      "title": "Большой пакет · 15 ГБ",
+      "days": 90,
+      "description": "15 ГБ на весь срок, без переноса и сброса лимита",
+      "price_minor": 40,
+      "traffic_limit_gb": 15,
+      "traffic_limit_strategy": "NO_RESET",
+      "terms": [
+        {
+          "days": 90,
+          "price_rub_minor": 4264,
+          "stars_amount": 40,
+          "stars_rub_equivalent_minor": 5017
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 7250,
+          "stars_amount": 68,
+          "stars_rub_equivalent_minor": 8529
+        }
+      ]
+    },
+    {
+      "code": "pack-500",
+      "panel_tag": "PLAN_PACK_500",
+      "title": "Пакет · 20 ГБ",
+      "days": 30,
+      "description": "20 ГБ на весь срок, без переноса и сброса лимита",
+      "price_minor": 50,
+      "traffic_limit_gb": 20,
+      "traffic_limit_strategy": "NO_RESET",
+      "terms": [
+        {
+          "days": 30,
+          "price_rub_minor": 5330,
+          "stars_amount": 50,
+          "stars_rub_equivalent_minor": 6271
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 14393,
+          "stars_amount": 135,
+          "stars_rub_equivalent_minor": 16933
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 27186,
+          "stars_amount": 255,
+          "stars_rub_equivalent_minor": 31984
+        }
+      ]
+    },
+    {
+      "code": "month-500",
+      "panel_tag": "PLAN_MONTH_500",
+      "title": "Месяц · 10 ГБ",
+      "days": 30,
+      "description": "До 10 ГБ за календарный месяц, сброс по расписанию Panel",
+      "price_minor": 50,
+      "traffic_limit_gb": 10,
+      "traffic_limit_strategy": "MONTH",
+      "terms": [
+        {
+          "days": 30,
+          "price_rub_minor": 5330,
+          "stars_amount": 50,
+          "stars_rub_equivalent_minor": 6271
+        },
+        {
+          "days": 90,
+          "price_rub_minor": 14393,
+          "stars_amount": 135,
+          "stars_rub_equivalent_minor": 16933
+        },
+        {
+          "days": 180,
+          "price_rub_minor": 27186,
+          "stars_amount": 255,
+          "stars_rub_equivalent_minor": 31984
+        }
+      ]
+    },
+    {
+      "code": "month",
+      "panel_tag": "PLAN_MONTH",
+      "title": "Неделя без тормозов",
+      "days": 7,
+      "description": "Архивный тариф, доступен только для ранее созданных заказов",
+      "price_minor": 10,
+      "traffic_limit_gb": null,
+      "device_limit": null,
+      "sellable": false
+    },
+    {
+      "code": "quarter",
+      "panel_tag": "PLAN_QUARTER",
+      "title": "Месяц без счётчика",
+      "days": 30,
+      "description": "Архивный тариф, доступен только для ранее созданных заказов",
+      "price_minor": 25,
+      "traffic_limit_gb": null,
+      "device_limit": null,
+      "sellable": false
+    },
+    {
+      "code": "year",
+      "panel_tag": "PLAN_YEAR",
+      "title": "Квартал «я тут живу»",
+      "days": 90,
+      "description": "Архивный тариф, доступен только для ранее созданных заказов",
+      "price_minor": 60,
+      "traffic_limit_gb": null,
+      "device_limit": null,
+      "sellable": false
+    },
+    {
+      "code": "data-3",
+      "panel_tag": "PLAN_DATA_3",
+      "title": "Трафик на минималках",
+      "days": 365,
+      "description": "Архивный тариф, доступен только для ранее созданных заказов",
+      "price_minor": 10,
+      "traffic_limit_gb": 3,
+      "permanent_traffic": true,
+      "sellable": false
+    },
+    {
+      "code": "data-10",
+      "panel_tag": "PLAN_DATA_10",
+      "title": "Вкладки не закрываю",
+      "days": 365,
+      "description": "Архивный тариф, доступен только для ранее созданных заказов",
+      "price_minor": 25,
+      "traffic_limit_gb": 10,
+      "permanent_traffic": true,
+      "sellable": false
+    },
+    {
+      "code": "data-30",
+      "panel_tag": "PLAN_DATA_30",
+      "title": "Сериал сам себя не посмотрит",
+      "days": 365,
+      "description": "Архивный тариф, доступен только для ранее созданных заказов",
+      "price_minor": 60,
+      "traffic_limit_gb": 30,
+      "permanent_traffic": true,
+      "sellable": false
+    },
+    {
+      "code": "data-50",
+      "panel_tag": "PLAN_DATA_50",
+      "title": "На все вкладки хватит",
+      "days": 365,
+      "description": "Архивный тариф, доступен только для ранее созданных заказов",
+      "price_minor": 90,
+      "traffic_limit_gb": 50,
+      "permanent_traffic": true,
+      "sellable": false
+    },
+    {
+      "code": "data-100",
+      "panel_tag": "PLAN_DATA_100",
+      "title": "Скачал весь интернет",
+      "days": 365,
+      "description": "Архивный тариф, доступен только для ранее созданных заказов",
+      "price_minor": 160,
+      "traffic_limit_gb": 100,
+      "permanent_traffic": true,
+      "sellable": false
+    }
+  ],
+  "pricing_reference": {
+    "usd_rub_rate": "83.6177",
+    "date": "17.10.2026",
+    "source": "https://www.cbr.ru/scripts/XML_daily.asp",
+    "usd_per_star": "0.015",
+    "rub_discount_percent": 15
+  }
+}
