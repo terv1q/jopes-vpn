@@ -30,7 +30,6 @@ dist/
 htmlcov/
 
 # Runtime data and generated files
-jopesvpn/assets/
 *.sqlite
 *.sqlite3
 *.db
