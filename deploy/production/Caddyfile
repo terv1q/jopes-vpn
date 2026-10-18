@@ -1,0 +1,42 @@
+{
+	admin localhost:2019
+	email {$ACME_EMAIL}
+}
+
+{$PANEL_DOMAIN} {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+	reverse_proxy remnawave:3000
+}
+
+# Branded Remnawave subscription page. It must be served at a host root, not
+# under a path, because its frontend assets live at /assets.
+{$CONNECT_DOMAIN} {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+	@support path /support /support/*
+	handle @support {
+		reverse_proxy ticket-forum:8080 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+	# The subscription page only has per-subscription paths; its root has no
+	# content and the upstream aborts the request. Send visitors to the channel.
+	@root path /
+	redir @root https://t.me/jopesvpn 302
+	reverse_proxy remnawave-subscription-page:3010
+}
+
+# The apex and www names get publicly trusted certificates and redirect to the
+# Panel.
+example.com, www.example.com {
+	redir https://{$PANEL_DOMAIN}{uri} permanent
+}
