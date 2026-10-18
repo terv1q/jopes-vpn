@@ -1,0 +1,251 @@
+name: jopesvpn-production
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  remnawave:
+    image: remnawave/backend:3.4.5@sha256:b16d724b90fd7c9fec2df04bd28938a671cafc62894105068e11550ee3449c56
+    container_name: jopesvpn-production-panel
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      APP_PORT: "3000"
+      METRICS_PORT: "3001"
+      API_INSTANCES: "1"
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@remnawave-db:5432/${POSTGRES_DB}
+      REDIS_SOCKET: /var/run/valkey/valkey.sock
+      APP_SECRET: ${APP_SECRET}
+      FRONT_END_DOMAIN: ${PANEL_DOMAIN}
+      SUB_PUBLIC_DOMAIN: ${SUB_PUBLIC_DOMAIN}
+      PANEL_DOMAIN: ${PANEL_DOMAIN}
+      METRICS_USER: ${METRICS_USER}
+      METRICS_PASS: ${METRICS_PASS}
+      WEBHOOK_SECRET_HEADER: ${WEBHOOK_SECRET_HEADER}
+      IS_TELEGRAM_NOTIFICATIONS_ENABLED: "false"
+    volumes:
+      - valkey-socket:/var/run/valkey
+    depends_on:
+      remnawave-db:
+        condition: service_healthy
+      remnawave-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    networks:
+      backend:
+        ipv4_address: 172.30.50.10
+      data: {}
+
+  remnawave-subscription-page:
+    image: remnawave/subscription-page:8.0.0@sha256:04e8d479afb3598024e4018e9e15cd7fe879938250090a690ba39f1ee91b79ac
+    container_name: jopesvpn-production-subpage
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      APP_PORT: "3010"
+      REMNAWAVE_PANEL_URL: http://remnawave:3000
+      REMNAWAVE_API_TOKEN: ${PANEL_API_TOKEN}
+      SUBPAGE_CONFIG_UUID: ${SUBPAGE_CONFIG_UUID:-00000000-0000-0000-0000-000000000000}
+      TRUST_PROXY: "1"
+    depends_on:
+      remnawave:
+        condition: service_healthy
+    networks:
+      - backend
+
+  remnawave-proxy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    container_name: jopesvpn-production-proxy
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL}
+      PANEL_DOMAIN: ${PANEL_DOMAIN}
+      CONNECT_DOMAIN: ${CONNECT_DOMAIN}
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      remnawave:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      backend:
+        aliases:
+          - ${PANEL_DOMAIN}
+      ticket-web: {}
+
+  remnawave-db:
+    image: postgres:18.4-alpine3.24@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    container_name: jopesvpn-production-db
+    restart: unless-stopped
+    logging: *default-logging
+    shm_size: 512mb
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      TZ: UTC
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - data
+
+  remnawave-redis:
+    image: valkey/valkey:9.0.2-alpine@sha256:68677f85c863830af7836ff07c4a13b7f085ebeff62f4dedb71499ca27d229f2
+    container_name: jopesvpn-production-valkey
+    restart: unless-stopped
+    logging: *default-logging
+    command:
+      - valkey-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory-policy
+      - noeviction
+      - --loglevel
+      - warning
+      - --unixsocket
+      - /var/run/valkey/valkey.sock
+      - --unixsocketperm
+      - "777"
+      - --port
+      - "0"
+    volumes:
+      - valkey-socket:/var/run/valkey
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-s", "/var/run/valkey/valkey.sock", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - data
+
+  bot:
+    profiles: ["bot"]
+    build:
+      context: ../..
+      dockerfile: deploy/production/Dockerfile.bot
+    image: jopesvpn-bot:1.0.0
+    container_name: jopesvpn-production-bot
+    restart: unless-stopped
+    logging: *default-logging
+    init: true
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      BOT_ADMIN_IDS: ${BOT_ADMIN_IDS}
+      PANEL_API_URL: https://${PANEL_DOMAIN}
+      PANEL_API_TOKEN: ${PANEL_API_TOKEN}
+      PANEL_CA_BUNDLE: ${PANEL_CA_BUNDLE}
+      PANEL_INTERNAL_SQUAD_UUID: ${PANEL_INTERNAL_SQUAD_UUID}
+      SUPPORT_CONTACT: ${SUPPORT_CONTACT:-}
+      TRIAL_CHANNEL_USERNAME: ${TRIAL_CHANNEL_USERNAME:-jopesvpn}
+      TRIAL_DAYS: ${TRIAL_DAYS:-3}
+      ENABLE_TRAFFIC_PLANS: ${ENABLE_TRAFFIC_PLANS:-0}
+      ENABLE_FREE_ACCESS: ${ENABLE_FREE_ACCESS:-0}
+      SUBSCRIPTION_PAGE_URL: ${SUBSCRIPTION_PAGE_URL:-https://connect.example.com}
+      TICKET_PORTAL_URL: ${TICKET_PORTAL_URL:-https://connect.example.com/support}
+      BOT_STATE_DB: /app/data/bot-state.sqlite3
+    volumes:
+      # Owner-editable tariffs; restart the bot after editing, no rebuild needed.
+      - ../../jopesvpn/plans.json:/app/jopesvpn/plans.json:ro
+      # Preferences, tickets, reminders, referrals and connection logs survive rebuilds.
+      - bot-data:/app/data
+    depends_on:
+      remnawave:
+        condition: service_healthy
+      remnawave-proxy:
+        condition: service_healthy
+    networks:
+      - backend
+
+  ticket-forum:
+    profiles: ["bot"]
+    build:
+      context: ../..
+      dockerfile: deploy/production/Dockerfile.ticket-portal
+    image: jopesvpn-ticket-portal:1.0.0
+    container_name: jopesvpn-production-ticket-forum
+    restart: unless-stopped
+    logging: *default-logging
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      BOT_ADMIN_IDS: ${BOT_ADMIN_IDS}
+      BOT_STATE_DB: /app/data/bot-state.sqlite3
+      TICKET_ADMIN_PASSWORD: ${TICKET_ADMIN_PASSWORD}
+      TICKET_SESSION_SECRET: ${TICKET_SESSION_SECRET}
+      TICKET_PORT: "8080"
+    volumes:
+      - bot-data:/app/data
+    depends_on:
+      bot:
+        condition: service_started
+    networks:
+      - ticket-web
+
+volumes:
+  postgres-data:
+    name: jopesvpn-production-postgres
+  valkey-socket:
+    name: jopesvpn-production-valkey-socket
+  caddy-data:
+    name: jopesvpn-production-caddy-data
+  caddy-config:
+    name: jopesvpn-production-caddy-config
+  bot-data:
+    name: jopesvpn-production-bot-data
+
+networks:
+  backend:
+    name: jopesvpn-production-backend
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.50.0/24
+  ticket-web:
+    name: jopesvpn-production-ticket-web
+    driver: bridge
+    internal: true
+  data:
+    name: jopesvpn-production-data
+    driver: bridge
+    internal: true

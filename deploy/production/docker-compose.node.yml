@@ -1,0 +1,22 @@
+services:
+  remnawave-node:
+    profiles: ["node"]
+    image: remnawave/node:3.4.2@sha256:1f97485b4bc7e4944f1ae95cc57d176376813b0022e9567b705f384f1a2e909d
+    container_name: jopesvpn-production-node
+    hostname: jopesvpn-node
+    network_mode: host
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    env_file:
+      - ${NODE_ENV_FILE:-.env.node}
+    stop_grace_period: 30s
