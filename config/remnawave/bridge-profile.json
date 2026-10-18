@@ -1,0 +1,78 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "JOPES_BRIDGE_IN",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none",
+        "flow": ""
+      },
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {
+          "target": "REPLACE_WITH_BRIDGE_REALITY_TARGET:443",
+          "serverNames": [
+            "REPLACE_WITH_BRIDGE_SERVER_NAME"
+          ],
+          "privateKey": "REPLACE_WITH_BRIDGE_REALITY_PRIVATE_KEY",
+          "shortIds": [
+            "REPLACE_WITH_BRIDGE_SHORT_ID"
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "BLOCK",
+      "protocol": "blackhole"
+    },
+    {
+      "tag": "TO_EXIT",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "REPLACE_WITH_EXIT_ADDRESS",
+            "port": 443,
+            "users": [
+              {
+                "id": "REPLACE_WITH_EXIT_SERVICE_USER_UUID",
+                "encryption": "none",
+                "flow": ""
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "REPLACE_WITH_EXIT_SERVER_NAME",
+          "fingerprint": "chrome",
+          "password": "REPLACE_WITH_EXIT_REALITY_PUBLIC_KEY",
+          "shortId": "REPLACE_WITH_EXIT_SHORT_ID"
+        }
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "JOPES_BRIDGE_IN"
+        ],
+        "outboundTag": "TO_EXIT"
+      }
+    ]
+  }
+}
