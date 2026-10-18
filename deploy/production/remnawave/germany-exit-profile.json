@@ -1,0 +1,53 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "JOPES_EXIT_IN",
+      "listen": "0.0.0.0",
+      "port": 2053,
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none",
+        "flow": ""
+      },
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {
+          "target": "REPLACE_WITH_GERMANY_REALITY_TARGET:443",
+          "serverNames": [
+            "REPLACE_WITH_GERMANY_SERVER_NAME"
+          ],
+          "privateKey": "REPLACE_WITH_GERMANY_REALITY_PRIVATE_KEY",
+          "shortIds": [
+            "REPLACE_WITH_GERMANY_SHORT_ID"
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "BLOCK",
+      "protocol": "blackhole"
+    },
+    {
+      "tag": "DIRECT",
+      "protocol": "freedom"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "JOPES_EXIT_IN"
+        ],
+        "outboundTag": "DIRECT"
+      }
+    ]
+  }
+}
