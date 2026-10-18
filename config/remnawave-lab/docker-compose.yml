@@ -1,0 +1,114 @@
+name: jopes-remnawave-lab
+
+services:
+  remnawave:
+    image: remnawave/backend:3.4.5@sha256:b16d724b90fd7c9fec2df04bd28938a671cafc62894105068e11550ee3449c56
+    container_name: jopes-rwlab-panel
+    hostname: remnawave
+    restart: "no"
+    env_file:
+      - "${LAB_SECRET_DIR}/panel.env"
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - valkey-socket:/var/run/valkey
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      remnawave-db:
+        condition: service_healthy
+      remnawave-redis:
+        condition: service_healthy
+    networks:
+      - lab
+
+  remnawave-proxy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    container_name: jopes-rwlab-proxy
+    restart: "no"
+    ports:
+      - "127.0.0.1:8443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      remnawave:
+        condition: service_healthy
+    networks:
+      - lab
+
+  remnawave-db:
+    image: postgres:18.4-alpine3.24@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    container_name: jopes-rwlab-db
+    hostname: remnawave-db
+    restart: "no"
+    shm_size: 512mb
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB}"
+      TZ: UTC
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}",
+        ]
+      interval: 3s
+      timeout: 10s
+      retries: 5
+    networks:
+      - lab
+
+  remnawave-redis:
+    image: valkey/valkey:9.0.2-alpine@sha256:68677f85c863830af7836ff07c4a13b7f085ebeff62f4dedb71499ca27d229f2
+    container_name: jopes-rwlab-valkey
+    hostname: remnawave-redis
+    restart: "no"
+    volumes:
+      - valkey-socket:/var/run/valkey
+    command:
+      - valkey-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory-policy
+      - noeviction
+      - --loglevel
+      - warning
+      - --unixsocket
+      - /var/run/valkey/valkey.sock
+      - --unixsocketperm
+      - "777"
+      - --port
+      - "0"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-s", "/var/run/valkey/valkey.sock", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+    networks:
+      - lab
+
+networks:
+  lab:
+    name: jopes-rwlab-internal
+    driver: bridge
+
+volumes:
+  caddy-data:
+    name: jopes-rwlab-caddy-data
+  caddy-config:
+    name: jopes-rwlab-caddy-config
+  postgres-data:
+    name: jopes-rwlab-postgres-data
+  valkey-socket:
+    name: jopes-rwlab-valkey-socket

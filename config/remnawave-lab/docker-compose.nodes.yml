@@ -1,0 +1,45 @@
+services:
+  node-bridge:
+    image: remnawave/node:3.4.2@sha256:1f97485b4bc7e4944f1ae95cc57d176376813b0022e9567b705f384f1a2e909d
+    container_name: jopes-rwlab-node-bridge
+    hostname: node-bridge
+    restart: "no"
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    env_file:
+      - "${LAB_SECRET_DIR}/bridge-node.env"
+    ports:
+      - "127.0.0.1:18443:443"
+    networks:
+      lab:
+        aliases:
+          - node-bridge
+
+  node-exit:
+    image: remnawave/node:3.4.2@sha256:1f97485b4bc7e4944f1ae95cc57d176376813b0022e9567b705f384f1a2e909d
+    container_name: jopes-rwlab-node-exit
+    hostname: node-exit
+    restart: "no"
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    env_file:
+      - "${LAB_SECRET_DIR}/exit-node.env"
+    ports:
+      - "127.0.0.1:18444:443"
+    networks:
+      lab:
+        aliases:
+          - node-exit
+
+networks:
+  lab:
+    name: jopes-rwlab-internal
+    external: true
