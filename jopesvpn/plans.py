@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 
 from jopesvpn.i18n import t
@@ -261,6 +261,42 @@ def format_rubles(amount_minor: int) -> str:
     rubles, kopeks = divmod(amount_minor, 100)
     amount = str(rubles) if kopeks == 0 else f"{rubles},{kopeks:02d}"
     return f"{amount} ₽"
+
+
+def stars_for_rub_amount(
+    amount_minor: int,
+    plans: tuple[Plan, ...],
+    *,
+    minimum_minor: int = 25_000,
+    maximum_minor: int = 10_000_000,
+) -> int:
+    if (
+        isinstance(amount_minor, bool)
+        or not isinstance(amount_minor, int)
+        or not minimum_minor <= amount_minor <= maximum_minor
+    ):
+        raise ValueError("Top-up amount is out of range")
+    term = next(
+        (
+            term
+            for plan in plans
+            if plan.sellable and plan.currency == "XTR"
+            for term in plan.terms
+            if term.price_rub_minor > 0 and term.stars_amount > 0
+        ),
+        None,
+    )
+    if term is None:
+        raise ValueError("Tariff catalog has no priced terms")
+    rub_per_star = Decimal(term.price_rub_minor) / Decimal(term.stars_amount)
+    stars = int(
+        (Decimal(amount_minor) / rub_per_star).to_integral_value(
+            rounding=ROUND_CEILING
+        )
+    )
+    if not 1 <= stars <= 10_000:
+        raise ValueError("Top-up Stars amount is out of range")
+    return stars
 
 
 def format_price(plan: Plan) -> str:

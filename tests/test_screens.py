@@ -321,13 +321,15 @@ class CabinetKeyboardTests(unittest.TestCase):
         }
         self.assertIn("pay:stars:lite-1:30", payment_buttons)
         self.assertNotIn("₽", payment_buttons["pay:stars:lite-1:30"])
+        self.assertIn("pay:balance:lite-1:30", payment_buttons)
+        self.assertIn("42,64 ₽", payment_buttons["pay:balance:lite-1:30"])
         self.assertIn("pay:unavailable:sbp:lite-1:30", payment_buttons)
         self.assertIn("pay:unavailable:card:lite-1:30", payment_buttons)
         self.assertIn("pay:unavailable:crypto:lite-1:30", payment_buttons)
         self.assertIn("42,64 ₽", payment_buttons["pay:unavailable:sbp:lite-1:30"])
         self.assertIn("42,64 ₽", payment_buttons["pay:unavailable:card:lite-1:30"])
         self.assertIn("42,64 ₽", payment_buttons["pay:unavailable:crypto:lite-1:30"])
-        self.assertEqual(len(payment_buttons), 6)
+        self.assertEqual(len(payment_buttons), 7)
 
         text = about_text(
             load_plans(),

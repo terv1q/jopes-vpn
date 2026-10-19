@@ -2250,22 +2250,12 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Тариф: Пробный", displays[-1])
         self.assertTrue(prefs.trial_was_used(12345))
 
-    async def test_referral_trial_grants_bounded_days_and_one_inviter_reward(self):
+    async def test_referral_trial_is_standard_duration_without_day_bonus(self):
         created: list[tuple] = []
         extensions: list[tuple[int, int]] = []
-        inviter = PanelUser(
-            id=77,
-            username="tg_1001",
-            telegram_id=1001,
-            status="ACTIVE",
-            expire_at="2030-01-01T00:00:00Z",
-            subscription_url=None,
-        )
 
         class Panel:
             async def get_user_by_telegram_id(self, telegram_id: int):
-                if telegram_id == 1001:
-                    return inviter
                 raise PanelNotFound("missing")
 
             async def create_user(
@@ -2332,12 +2322,12 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(
                 created,
-                [(12345, settings.trial_days + 3, settings.panel_internal_squad_uuid, "TRIAL")],
+                [(12345, settings.trial_days, settings.panel_internal_squad_uuid, "TRIAL")],
             )
-            self.assertEqual(extensions, [(1001, 10)])
+            self.assertEqual(extensions, [])
             self.assertEqual(
                 prefs.referral_stats(1001),
-                {"invited": 1, "activated": 1, "reward_days": 10, "pending": 0},
+                {"invited": 1, "activated": 1, "reward_days": 0, "pending": 0},
             )
             self.assertTrue(prefs.trial_was_used(12345))
 

@@ -30,6 +30,13 @@ from jopesvpn.timezones import (
     format_datetime,
     utc_label,
 )
+from jopesvpn.wallet import (
+    MIN_TOPUP_MINOR,
+    MIN_WITHDRAWAL_MINOR,
+    WalletAccount,
+    WalletEntry,
+    WithdrawalRequest,
+)
 
 
 def channel_title() -> str:
@@ -290,6 +297,7 @@ def more_keyboard() -> InlineKeyboardMarkup:
             [(t("common.plans"), "user:plans")],
             [(t("common.guides"), "user:guides")],
             [(t("common.about"), "user:about")],
+            [(t("wallet.open_button"), "user:wallet")],
             [(t("common.cooperation"), "user:referrals")],
             [(t("common.settings"), "user:settings")],
             [(t("common.help"), "user:help")],
@@ -415,7 +423,16 @@ def payment_methods_keyboard(plan: Plan, term: PlanTerm) -> InlineKeyboardMarkup
                 text=t("plans.pay_stars", amount=term.stars_amount),
                 callback_data=f"pay:stars:{plan.code}:{term.days}",
             )
-        ]
+        ],
+        [
+            InlineKeyboardButton(
+                text=t(
+                    "plans.pay_balance",
+                    amount=format_rubles(term.price_rub_minor),
+                ),
+                callback_data=f"pay:balance:{plan.code}:{term.days}",
+            )
+        ],
     ]
     for method in ("sbp", "card", "crypto"):
         rows.append(
@@ -1056,10 +1073,26 @@ def referral_share_url(invite_url: str) -> str:
     )
 
 
-def referral_keyboard(share_url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [_url_button(t("referral.share"), share_url)],
+def referral_keyboard(
+    share_url: str, *, withdraw_available: bool = False
+) -> InlineKeyboardMarkup:
+    rows = [[_url_button(t("referral.share"), share_url)]]
+    if withdraw_available:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=t("wallet.withdraw_button"),
+                    callback_data="withdraw:request",
+                )
+            ]
+        )
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text=t("wallet.open_button"), callback_data="user:wallet"
+                )
+            ],
             [
                 InlineKeyboardButton(
                     text=t("common.refresh"), callback_data="user:referrals"
@@ -1075,6 +1108,7 @@ def referral_keyboard(share_url: str) -> InlineKeyboardMarkup:
             ],
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def referral_text(stats: dict[str, int], invite_url: str) -> str:
@@ -1086,18 +1120,263 @@ def referral_text(stats: dict[str, int], invite_url: str) -> str:
                 [
                     t("referral.invited", count=stats["invited"]),
                     t("referral.activated", count=stats["activated"]),
+                    t("referral.paying", count=stats["paying"]),
+                    t("referral.purchases", count=stats["purchases"]),
                     t(
-                        "referral.waiting",
-                        count=max(0, stats["invited"] - stats["activated"]),
+                        "referral.earned",
+                        amount=format_rubles(stats["earned_minor"]),
                     ),
-                    t("referral.rewarded", days=stats["reward_days"]),
-                    t("referral.pending", count=stats["pending"]),
+                    t(
+                        "referral.available",
+                        amount=format_rubles(stats["available_minor"]),
+                    ),
                 ],
+            ),
+            f"<b>{t('referral.program_title')}</b>\n"
+            + "\n".join(
+                [
+                    t("referral.rate_first"),
+                    t("referral.rate_second"),
+                    t("referral.rate_next"),
+                    t("referral.rate_topup"),
+                ]
             ),
             t("referral.rules"),
             t("referral.link", link=escape(invite_url)),
         ]
     )
+
+
+WALLET_KIND_KEYS = {
+    "TOPUP": "wallet.kind_topup",
+    "PURCHASE": "wallet.kind_purchase",
+    "REFERRAL": "wallet.kind_referral",
+    "TOPUP_REFUND": "wallet.kind_topup_refund",
+    "REFERRAL_TOPUP_REFUND": "wallet.kind_referral_refund",
+    "WITHDRAWAL": "wallet.kind_withdrawal",
+}
+
+
+def _entry_moment(entry: WalletEntry) -> str:
+    try:
+        moment = datetime.fromisoformat(entry.created_at)
+    except ValueError:
+        return entry.created_at[:10]
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return format_datetime(moment, current_utc_offset())
+
+
+def wallet_entry_text(entry: WalletEntry) -> str:
+    label = t(WALLET_KIND_KEYS.get(entry.kind, "wallet.kind_other"))
+    if entry.balance_delta_minor:
+        delta = entry.balance_delta_minor
+        sign = "+" if delta > 0 else "−"
+        amount = format_rubles(abs(delta))
+    elif entry.referral_delta_minor:
+        delta = entry.referral_delta_minor
+        sign = "+" if delta > 0 else "−"
+        amount = format_rubles(abs(delta))
+    else:
+        sign = "−"
+        amount = format_rubles(entry.amount_minor)
+    return t(
+        "wallet.history_row",
+        label=escape(label),
+        amount=f"{sign}{amount}",
+        date=_entry_moment(entry),
+    )
+
+
+def wallet_text(
+    account: WalletAccount,
+    entries: list[WalletEntry],
+    pending: WithdrawalRequest | None,
+) -> str:
+    balance_rows = [
+        t("wallet.balance_row", amount=format_rubles(account.balance_minor)),
+        t(
+            "wallet.referral_row",
+            amount=format_rubles(account.referral_earned_minor),
+        ),
+        t(
+            "wallet.withdrawable_row",
+            amount=format_rubles(account.referral_available_minor),
+        ),
+    ]
+    if pending is not None:
+        balance_rows.append(
+            t(
+                "wallet.pending_row",
+                amount=format_rubles(pending.amount_minor),
+                request_id=pending.id[:8],
+            )
+        )
+    history_rows = [wallet_entry_text(entry) for entry in entries]
+    if not history_rows:
+        history_rows = [t("wallet.history_empty")]
+    return "\n\n".join(
+        [
+            _heading(t("wallet.title")),
+            _box(t("wallet.balance_title"), balance_rows),
+            _box(t("wallet.history_title"), history_rows),
+            t("wallet.note"),
+        ]
+    )
+
+
+def wallet_keyboard(
+    *, withdraw_available: bool = False, withdrawal_pending: bool = False
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=t("wallet.topup_button"), callback_data="user:topup"
+            )
+        ]
+    ]
+    if withdraw_available:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=t("wallet.withdraw_button"),
+                    callback_data="withdraw:request",
+                )
+            ]
+        )
+    elif withdrawal_pending:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=t("wallet.withdraw_pending_button"),
+                    callback_data="withdraw:status",
+                )
+            ]
+        )
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text=t("common.cooperation"),
+                    callback_data="user:referrals",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=t("common.refresh"), callback_data="user:wallet"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=t("common.back"), callback_data="user:back"
+                ),
+                InlineKeyboardButton(
+                    text=t("common.menu"), callback_data="user:home"
+                ),
+            ],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def topup_text() -> str:
+    return "\n\n".join(
+        [
+            _heading(t("wallet.topup_title")),
+            t(
+                "wallet.topup_intro",
+                minimum=format_rubles(MIN_TOPUP_MINOR),
+                maximum=format_rubles(10_000_000),
+            ),
+            t("wallet.topup_rate_note"),
+        ]
+    )
+
+
+def topup_amount_keyboard(
+    stars_for: dict[int, int] | None = None,
+) -> InlineKeyboardMarkup:
+    amounts = (25_000, 50_000, 100_000, 200_000)
+    stars_for = stars_for or {}
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=t(
+                    "wallet.topup_preset",
+                    amount=format_rubles(amount),
+                    stars=stars_for.get(amount, 0),
+                )[:64],
+                callback_data=f"topup:amount:{amount}",
+            )
+        ]
+        for amount in amounts
+    ]
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text=t("wallet.topup_custom"), callback_data="topup:custom"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=t("common.back"), callback_data="user:wallet"
+                ),
+                InlineKeyboardButton(
+                    text=t("common.menu"), callback_data="user:home"
+                ),
+            ],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def topup_custom_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=t("common.cancel"), callback_data="topup:cancel"
+                )
+            ]
+        ]
+    )
+
+
+def withdrawal_confirm_keyboard(amount_minor: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=t(
+                        "wallet.withdraw_confirm",
+                        amount=format_rubles(amount_minor),
+                    )[:64],
+                    callback_data="withdraw:confirm",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=t("common.cancel"), callback_data="user:wallet"
+                )
+            ],
+        ]
+    )
+
+
+def withdrawal_text(
+    available_minor: int, support_contact: str | None
+) -> str:
+    text = t(
+        "wallet.withdraw_intro",
+        amount=format_rubles(available_minor),
+        minimum=format_rubles(MIN_WITHDRAWAL_MINOR),
+    )
+    if support_contact:
+        text += "\n\n" + t(
+            "wallet.withdraw_support", support=escape(support_contact)
+        )
+    return text
 
 
 DEVICES_PER_PAGE = 8

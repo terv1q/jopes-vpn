@@ -104,40 +104,149 @@ MESSAGES: dict[str, object] = {
     ),
     "docs.admin_saved": "Ссылка обновлена.",
     "docs.admin_cancelled": "Изменение ссылки отменено.",
-    "referral.button": "🤝 Пригласить и получить бонус",
+    "referral.button": "🤝 Пригласить и получить процент",
     "referral.title": "🤝 СОТРУДНИЧЕСТВО",
     "referral.stats": "Ваша статистика",
     "referral.invited": "Пригласили: {count}",
-    "referral.activated": "Активировали пробный доступ: {count}",
-    "referral.waiting": "Ждут активации: {count}",
-    "referral.rewarded": "Подтверждённый бонус: {days} дн.",
-    "referral.pending": "Начислений на проверке: {count}",
+    "referral.activated": "Запустили бота: {count}",
+    "referral.paying": "Оплатили: {count}",
+    "referral.purchases": "Покупок приглашённых: {count}",
+    "referral.earned": "Начислено: {amount}",
+    "referral.available": "Доступно к выводу: {amount}",
+    "referral.program_title": "Условия программы",
+    "referral.rate_first": "Первая покупка приглашённого: 70% суммы.",
+    "referral.rate_second": "Вторая покупка приглашённого: 40% суммы.",
+    "referral.rate_next": "Каждая следующая покупка: 20% суммы.",
+    "referral.rate_topup": "Каждое пополнение баланса: 20% суммы.",
+    "referral.rules": (
+        "Процент считается от суммы покупки тарифа или пополнения баланса, "
+        "которое оплатил приглашённый. Начисления зачисляются на реферальный "
+        "счёт отдельно от рублёвого баланса. Вывод доступен от 250 ₽ через "
+        "заявку в поддержку. Один Telegram-аккаунт учитывается только один раз. "
+        "Повторная привязка к другому пригласившему невозможна."
+    ),
     "referral.link": "Ваша ссылка:\n<code>{link}</code>",
     "referral.share": "Поделиться приглашением",
-    "referral.rules": (
-        "Пригласите друга по ссылке выше. Когда он впервые активирует пробный "
-        "доступ, ему добавятся 3 дня, а вам — 10 дней после подтверждения "
-        "выдачи бонуса. Можно получить до 60 бонусных дней за календарный "
-        "месяц. Один Telegram-аккаунт учитывается только один раз."
-    ),
     "referral.new_visit": (
         "По вашей ссылке пришёл новый пользователь Jopes VPN. "
-        "Бонус начислится после активации им пробного доступа."
-    ),
-    "referral.inviter_reward": (
-        "Ваш приглашённый впервые подключил VPN. "
-        "Вам начислено +{days} дней."
-    ),
-    "referral.invitee_bonus": (
-        "За приглашение добавлено ещё 3 дня."
+        "Реферальное начисление появится после его покупки или пополнения баланса."
     ),
     "referral.unavailable": "Статистика приглашений сейчас недоступна.",
     "referral.bot_username_missing": (
         "Не удалось сформировать ссылку. Попробуйте позже или напишите в поддержку."
     ),
+    "referral.reward_notice": (
+        "Реферальное начисление: +{amount} за {event}. Средства доступны "
+        "к выводу в разделе «Баланс»."
+    ),
+    "referral.reward_purchase_event": "покупку приглашённого ({percent}%)",
+    "referral.reward_topup_event": "пополнение приглашённого ({percent}%)",
     "referral.reward_pending_notice": (
-        "Пробный доступ активирован, включая бонус по приглашению. Начисление "
-        "пригласившему проверяется; если возникла задержка, поддержка поможет."
+        "Реферальное начисление будет зачислено после подтверждения оплаты."
+    ),
+
+    "wallet.title": "💰 БАЛАНС",
+    "wallet.balance_title": "Средства",
+    "wallet.balance_row": "Рублёвый баланс: {amount}",
+    "wallet.referral_row": "Реферальный доход: {amount}",
+    "wallet.withdrawable_row": "Доступно к выводу: {amount}",
+    "wallet.pending_row": "Заявка на вывод: {amount} · № {request_id}",
+    "wallet.history_title": "История операций",
+    "wallet.history_empty": "Операций пока нет.",
+    "wallet.history_row": "{label}: <b>{amount}</b> · {date}",
+    "wallet.kind_topup": "Пополнение",
+    "wallet.kind_purchase": "Оплата тарифа",
+    "wallet.kind_referral": "Реферальное начисление",
+    "wallet.kind_topup_refund": "Возврат пополнения",
+    "wallet.kind_referral_refund": "Корректировка начисления",
+    "wallet.kind_withdrawal": "Вывод средств",
+    "wallet.kind_other": "Операция",
+    "wallet.note": (
+        "Рублёвый баланс оплачивает тарифы. Реферальный доход хранится "
+        "отдельно и выводится через поддержку. Минимальная сумма вывода: 250 ₽."
+    ),
+    "wallet.topup_button": "➕ Пополнить баланс",
+    "wallet.withdraw_button": "💸 Вывести реферальный доход",
+    "wallet.withdraw_pending_button": "⏳ Заявка на вывод отправлена",
+    "wallet.open_button": "💰 Баланс и история",
+    "wallet.topup_title": "ПОПОЛНЕНИЕ БАЛАНСА",
+    "wallet.topup_intro": (
+        "Введите сумму от {minimum} до {maximum}. Бот рассчитает стоимость "
+        "в Telegram Stars, а после оплаты зачислит рубли на баланс."
+    ),
+    "wallet.topup_rate_note": (
+        "Курс соответствует тарифам каталога. Начисляется ровно введённая "
+        "сумма в рублях. Оплата проходит через Telegram Stars."
+    ),
+    "wallet.topup_preset": "{amount} · {stars} ⭐",
+    "wallet.topup_custom": "✍️ Ввести другую сумму",
+    "wallet.topup_prompt": (
+        "Введите сумму пополнения в рублях, например 500 или 750,50. "
+        "Минимальная сумма: {minimum}."
+    ),
+    "wallet.topup_invalid": (
+        "Не удалось распознать сумму. Введите число в рублях не меньше {minimum}."
+    ),
+    "wallet.topup_too_large": "Максимальная сумма пополнения: {maximum}.",
+    "wallet.topup_invoice_title": "Пополнение Jopes VPN",
+    "wallet.topup_invoice_description": "Зачисление {amount} на баланс",
+    "wallet.topup_invoice_sent": (
+        "Счёт на {amount} отправлен. После оплаты сумма появится на балансе."
+    ),
+    "wallet.topup_success": (
+        "✅ Баланс пополнен на {amount}. Доступный баланс: {balance}."
+    ),
+    "wallet.topup_review": (
+        "Оплата получена, но зачисление задержалось. Мы проверим операцию; "
+        "повторно оплачивать не нужно."
+    ),
+    "wallet.refund_admin": (
+        "ℹ️ Возврат Stars по пополнению <code>{request_id}</code> учтён. "
+        "Баланс и реферальное начисление скорректированы."
+    ),
+    "wallet.refund_user_notice": (
+        "Возврат пополнения выполнен. Сумма списана с рублёвого баланса. "
+        "Если баланс уже израсходован, поддержка поможет урегулировать разницу."
+    ),
+    "wallet.withdraw_intro": (
+        "Доступно к выводу: {amount}. Заявка будет передана в поддержку. "
+        "Автоматическая выплата не выполняется. Минимальная сумма: {minimum}."
+    ),
+    "wallet.withdraw_support": (
+        "Поддержка: {support}. Реквизиты выплаты согласуются в обращении."
+    ),
+    "wallet.withdraw_confirm": "Отправить заявку на {amount}",
+    "wallet.withdraw_created": (
+        "✅ Заявка на вывод {amount} создана. Номер: <code>{request_id}</code>. "
+        "Поддержка свяжется с вами для согласования выплаты."
+    ),
+    "wallet.withdraw_admin": (
+        "💸 Новая заявка на вывод\n"
+        "Номер: <code>{request_id}</code>\n"
+        "Пользователь: {name} · <code>{telegram_id}</code>\n"
+        "Сумма: {amount}\n"
+        "Выплата выполняется вручную после согласования реквизитов."
+    ),
+    "wallet.withdraw_pending_error": (
+        "Заявка на вывод уже отправлена. Дождитесь ответа поддержки."
+    ),
+    "wallet.withdraw_minimum": (
+        "Вывод доступен от 250 ₽. Сейчас к выводу: {amount}."
+    ),
+    "wallet.withdraw_unavailable": (
+        "Сейчас нельзя создать заявку на вывод. Попробуйте позже."
+    ),
+    "wallet.unavailable": "Баланс сейчас недоступен. Попробуйте позже.",
+    "wallet.insufficient": (
+        "Недостаточно средств. Нужно {required}, на балансе {balance}. "
+        "Пополните баланс и повторите оплату."
+    ),
+    "wallet.payment_blocked": (
+        "Не удалось оплатить тариф с баланса. Средства не списаны. "
+        "Проверьте баланс и повторите попытку."
+    ),
+    "wallet.payment_applied": (
+        "Этот платёж уже обработан. Средства повторно не списывались."
     ),
     "trial.nudge": (
         "Вы открывали Jopes VPN, но ещё не подключились. Если хотите, можно "
@@ -839,6 +948,7 @@ MESSAGES: dict[str, object] = {
         "покажет полную цену в рублях, срок и сумму в Stars."
     ),
     "plans.pay_stars": "⭐ Telegram Stars · {amount} ⭐",
+    "plans.pay_balance": "💰 Оплатить с баланса · {amount}",
     "plans.pay_sbp": "СБП · {amount} · техработы",
     "plans.pay_card": "Карта · {amount} · техработы",
     "plans.pay_crypto": "Криптовалюта · {amount} · техработы",

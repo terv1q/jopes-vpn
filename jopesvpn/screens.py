@@ -38,6 +38,8 @@ USER_BANNERS = {
     "about": "support",
     "cabinet": "cabinet",
     "profile": "cabinet",
+    "wallet": "cabinet",
+    "topup": "plans",
     "connect": "connect",
     "subscription": "subscription",
     "key": "subscription",
@@ -89,8 +91,10 @@ def banner_for_callback(data: str | None) -> str | None:
         return "settings"
     if data.startswith(("guide:", "g:", "platform:")):
         return "guides"
-    if data.startswith(("checkout:", "term:", "pay:")):
+    if data.startswith(("checkout:", "term:", "pay:", "topup:")):
         return "plans"
+    if data.startswith("withdraw:"):
+        return "cabinet"
     if data.startswith("user:"):
         action = data.removeprefix("user:").partition(":")[0]
         return USER_BANNERS.get(action)

@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import time
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import escape
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -81,6 +82,7 @@ from jopesvpn.plans import (
     PlanTerm,
     format_rubles,
     load_plans,
+    stars_for_rub_amount,
     term_savings,
 )
 from jopesvpn.preferences import PreferencesError, PreferencesStore
@@ -162,9 +164,28 @@ from jopesvpn.ui import (
     tariff_text,
     timezone_keyboard,
     timezone_text,
+    topup_amount_keyboard,
+    topup_custom_keyboard,
+    topup_text,
     trial_keyboard,
     trial_text,
     troubleshooting_text,
+    wallet_keyboard,
+    wallet_text,
+    withdrawal_confirm_keyboard,
+    withdrawal_text,
+)
+from jopesvpn.wallet import (
+    MIN_TOPUP_MINOR,
+    MIN_WITHDRAWAL_MINOR,
+    InsufficientFunds,
+    TopupConflict,
+    TopupNotFound,
+    WalletConflict,
+    WalletError,
+    WalletStore,
+    WithdrawalPending,
+    WithdrawalUnavailable,
 )
 
 logger = logging.getLogger(__name__)
@@ -228,6 +249,10 @@ class TicketFlow(StatesGroup):
     awaiting_new_message = State()
     awaiting_user_reply = State()
     awaiting_admin_reply = State()
+
+
+class TopUpFlow(StatesGroup):
+    awaiting_amount = State()
 
 
 class LanguageMiddleware(BaseMiddleware):
@@ -483,13 +508,11 @@ router.pre_checkout_query.outer_middleware(DocumentsConsentMiddleware())
 
 
 TRIAL_TAG = "TRIAL"
-REFERRAL_INVITER_REWARD_DAYS = 10
-REFERRAL_INVITER_MONTHLY_CAP_DAYS = 60
-REFERRAL_INVITEE_BONUS_DAYS = 3
 _trial_lock = asyncio.Lock()
 _device_lock = asyncio.Lock()
 _admin_plan_lock = asyncio.Lock()
 _free_access_lock = asyncio.Lock()
+_balance_purchase_lock = asyncio.Lock()
 _device_delete_attempts: dict[int, list[float]] = {}
 DEVICE_DELETE_LIMIT = 5
 DEVICE_DELETE_WINDOW_SECONDS = 60.0
@@ -1134,6 +1157,7 @@ async def _user_screen(
     settings: Settings,
     plans: tuple[Plan, ...],
     prefs: PreferencesStore | None = None,
+    wallet: WalletStore | None = None,
 ) -> None:
     if callback.message is None or callback.message.chat.type != "private":
         await callback.answer(t("alert.private_chat"), show_alert=True)
@@ -1223,13 +1247,13 @@ async def _user_screen(
         await callback.answer()
         await _render_stats(callback, panel)
     elif screen == "referrals":
-        if prefs is None:
+        if prefs is None or wallet is None:
             await callback.answer(t("referral.unavailable"), show_alert=True)
             return
         try:
-            stats = prefs.referral_stats(callback.from_user.id)
+            summary = wallet.referral_summary(callback.from_user.id)
             bot_user = await bot.get_me()
-        except (PreferencesError, TelegramAPIError):
+        except (WalletError, TelegramAPIError):
             logger.warning("Referral statistics could not be loaded")
             await callback.answer(t("referral.unavailable"), show_alert=True)
             return
@@ -1239,11 +1263,64 @@ async def _user_screen(
         invite_url = (
             f"https://t.me/{bot_user.username}?start=ref_{callback.from_user.id}"
         )
+        stats = {
+            "invited": summary.invited,
+            "activated": summary.activated,
+            "paying": summary.paying,
+            "purchases": summary.purchases,
+            "earned_minor": summary.earned_minor,
+            "available_minor": summary.available_minor,
+        }
         await callback.answer()
         await _edit_or_send(
             callback,
             referral_text(stats, invite_url),
-            referral_keyboard(referral_share_url(invite_url)),
+            referral_keyboard(
+                referral_share_url(invite_url),
+                withdraw_available=(
+                    summary.available_minor >= MIN_WITHDRAWAL_MINOR
+                    and summary.pending_withdrawal_id is None
+                ),
+            ),
+        )
+    elif screen == "wallet":
+        if wallet is None:
+            await callback.answer(t("wallet.unavailable"), show_alert=True)
+            return
+        try:
+            account = wallet.account(callback.from_user.id)
+            entries = wallet.history(callback.from_user.id)
+            pending = wallet.pending_withdrawal(callback.from_user.id)
+        except WalletError:
+            logger.warning("Wallet screen could not be loaded")
+            await callback.answer(t("wallet.unavailable"), show_alert=True)
+            return
+        await callback.answer()
+        await _edit_or_send(
+            callback,
+            wallet_text(account, entries, pending),
+            wallet_keyboard(
+                withdraw_available=(
+                    pending is None
+                    and account.referral_available_minor
+                    >= MIN_WITHDRAWAL_MINOR
+                ),
+                withdrawal_pending=pending is not None,
+            ),
+        )
+    elif screen == "topup":
+        if wallet is None:
+            await callback.answer(t("wallet.unavailable"), show_alert=True)
+            return
+        stars_for: dict[int, int] = {}
+        for amount in (25_000, 50_000, 100_000, 200_000):
+            try:
+                stars_for[amount] = stars_for_rub_amount(amount, plans)
+            except ValueError:
+                stars_for[amount] = 0
+        await callback.answer()
+        await _edit_or_send(
+            callback, topup_text(), topup_amount_keyboard(stars_for)
         )
     elif screen == "settings":
         await callback.answer()
@@ -1580,6 +1657,30 @@ async def start(
     if prefs is None:
         await message.answer(t("docs.accept_failed"))
         return
+    referral_registered = False
+    referrer_id: int | None = None
+    try:
+        prefs.reset_navigation(message.from_user.id)
+        command_parts = (message.text or "").split(maxsplit=1)
+        if len(command_parts) == 2 and re.fullmatch(
+            r"ref_[1-9][0-9]{0,18}", command_parts[1].strip()
+        ):
+            candidate = int(command_parts[1][4:])
+            if candidate <= 9_223_372_036_854_775_807:
+                referrer_id = candidate
+        referral_registered = prefs.register_start(
+            message.from_user.id, referrer_id
+        )
+        prefs.remember(
+            message.from_user.id,
+            message.from_user.first_name,
+            message.from_user.last_name,
+            message.from_user.username,
+        )
+    except (PreferencesError, ValueError):
+        logger.warning("Preferences database is unavailable")
+    if referral_registered and referrer_id is not None:
+        await _notify_referrer(bot, referrer_id, t("referral.new_visit"))
     try:
         consented = prefs.documents_accepted(
             message.from_user.id, prefs.documents_version()
@@ -1601,31 +1702,6 @@ async def start(
             banner="support",
         )
         return
-    referral_registered = False
-    referrer_id: int | None = None
-    if prefs is not None:
-        try:
-            prefs.reset_navigation(message.from_user.id)
-            command_parts = (message.text or "").split(maxsplit=1)
-            if len(command_parts) == 2 and re.fullmatch(
-                r"ref_[1-9][0-9]{0,18}", command_parts[1].strip()
-            ):
-                candidate = int(command_parts[1][4:])
-                if candidate <= 9_223_372_036_854_775_807:
-                    referrer_id = candidate
-            referral_registered = prefs.register_start(
-                message.from_user.id, referrer_id
-            )
-            prefs.remember(
-                message.from_user.id,
-                message.from_user.first_name,
-                message.from_user.last_name,
-                message.from_user.username,
-            )
-        except (PreferencesError, ValueError):
-            logger.warning("Preferences database is unavailable")
-    if referral_registered and referrer_id is not None:
-        await _notify_referrer(bot, referrer_id, t("referral.new_visit"))
     text, page_url, has_access, trial_available = await _home_view(
         message.from_user.first_name or t("common.friend"),
         message.from_user.id,
@@ -1825,6 +1901,7 @@ async def user_navigation(
     state: FSMContext,
     plans: tuple[Plan, ...],
     prefs: PreferencesStore | None = None,
+    wallet: WalletStore | None = None,
 ) -> None:
     assert callback.data is not None
     action = callback.data.removeprefix("user:")
@@ -1841,6 +1918,8 @@ async def user_navigation(
         "connect",
         "subscription",
         "referrals",
+        "wallet",
+        "topup",
         "devices",
         "stats",
         "settings",
@@ -1920,7 +1999,9 @@ async def user_navigation(
         await _toggle_reminders(callback, panel, settings, prefs, action)
         return
     if action.startswith("set:lang:"):
-        await _user_screen(callback, bot, panel, action, settings, plans, prefs)
+        await _user_screen(
+            callback, bot, panel, action, settings, plans, prefs, wallet
+        )
         return
 
     if action in screens or action.startswith(
@@ -1933,7 +2014,9 @@ async def user_navigation(
             "languages:",
         )
     ):
-        await _user_screen(callback, bot, panel, action, settings, plans, prefs)
+        await _user_screen(
+            callback, bot, panel, action, settings, plans, prefs, wallet
+        )
     else:
         await callback.answer(t("alert.stale_button"), show_alert=True)
 
@@ -3097,8 +3180,7 @@ async def _run_trial(
         try:
             created = await panel.create_user(
                 telegram_id,
-                settings.trial_days
-                + (REFERRAL_INVITEE_BONUS_DAYS if referrer_id is not None else 0),
+                settings.trial_days,
                 settings.panel_internal_squad_uuid,
                 tag=TRIAL_TAG,
             )
@@ -3111,64 +3193,13 @@ async def _run_trial(
             )
             return
 
-    referral_notice = ""
-    invitee_bonus_notice = ""
     if prefs is not None:
         try:
             prefs.mark_trial_used(telegram_id)
+            if referrer_id is not None:
+                prefs.mark_referral_activated(telegram_id)
         except PreferencesError:
             logger.warning("Trial usage state could not be saved")
-        if referrer_id is not None:
-            invitee_bonus_notice = t("referral.invitee_bonus")
-            try:
-                prefs.mark_referral_activated(telegram_id)
-                reserved = prefs.reserve_referral_reward(
-                    telegram_id,
-                    reward_month=datetime.now(UTC).strftime("%Y-%m"),
-                    reward_days=REFERRAL_INVITER_REWARD_DAYS,
-                    monthly_cap=REFERRAL_INVITER_MONTHLY_CAP_DAYS,
-                )
-                if reserved:
-                    try:
-                        inviter = await panel.get_user_by_telegram_id(referrer_id)
-                    except PanelNotFound:
-                        prefs.skip_referral_reward(telegram_id)
-                    except PanelError as error:
-                        logger.warning(
-                            "Referral inviter lookup remains pending (%s)",
-                            type(error).__name__,
-                        )
-                        referral_notice = t("referral.reward_pending_notice")
-                    else:
-                        if inviter.status not in {"ACTIVE", "EXPIRED"}:
-                            prefs.skip_referral_reward(telegram_id)
-                        else:
-                            try:
-                                await panel.extend_user(
-                                    inviter, REFERRAL_INVITER_REWARD_DAYS
-                                )
-                            except PanelError as error:
-                                logger.warning(
-                                    "Referral reward remains pending (%s)",
-                                    type(error).__name__,
-                                )
-                                referral_notice = t("referral.reward_pending_notice")
-                            else:
-                                prefs.finish_referral_reward(telegram_id)
-                                await _notify_referrer(
-                                    bot,
-                                    referrer_id,
-                                    t(
-                                        "referral.inviter_reward",
-                                        days=REFERRAL_INVITER_REWARD_DAYS,
-                                    ),
-                                )
-            except (PanelError, PreferencesError) as error:
-                logger.warning(
-                    "Referral reward could not be processed (%s)",
-                    type(error).__name__,
-                )
-                referral_notice = t("referral.reward_pending_notice")
 
     page_url = _page_url(created, settings)
     try:
@@ -3216,9 +3247,7 @@ async def _run_trial(
         f"├ {t('common.tariff')}: {escape(tariff_text(created) or TRIAL_TAG)}\n"
         f"└ {t('common.expires')}: {_expiry_text(created)}</blockquote>\n\n"
         f"{t('trial.activated_note')}"
-        f"{setup_text}"
-        + (f"\n\n{invitee_bonus_notice}" if invitee_bonus_notice else "")
-        + (f"\n\n{referral_notice}" if referral_notice else ""),
+        f"{setup_text}",
         setup_markup,
     )
 
@@ -3441,6 +3470,19 @@ def _order_is_current(order) -> bool:
         created = created.replace(tzinfo=UTC)
     age = datetime.now(UTC) - created.astimezone(UTC)
     return timedelta(0) <= age <= timedelta(minutes=30)
+
+
+def _order_is_recent(order, seconds: int = 45) -> bool:
+    try:
+        created = datetime.fromisoformat(
+            order.created_at.replace("Z", "+00:00")
+        )
+    except (AttributeError, ValueError):
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    age = datetime.now(UTC) - created.astimezone(UTC)
+    return timedelta(0) <= age <= timedelta(seconds=seconds)
 
 
 def _order_plan_term(
@@ -3691,6 +3733,427 @@ async def payment_review_loop(
         await asyncio.sleep(interval_seconds)
 
 
+def _parse_rub_amount(raw: str) -> int | None:
+    cleaned = (
+        raw.strip()
+        .replace(" ", "")
+        .replace(" ", "")
+        .replace(",", ".")
+        .replace("₽", "")
+        .casefold()
+    )
+    for suffix in ("рублей", "рубля", "рубль", "руб"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)]
+            break
+    try:
+        value = Decimal(cleaned)
+    except InvalidOperation:
+        return None
+    if not value.is_finite() or value <= 0:
+        return None
+    minor = int((value * 100).to_integral_value(rounding=ROUND_HALF_UP))
+    return minor if minor > 0 else None
+
+
+async def _send_topup_invoice(
+    message: Message,
+    wallet: WalletStore,
+    plans: tuple[Plan, ...],
+    telegram_id: int,
+    amount_minor: int,
+) -> bool:
+    try:
+        stars = stars_for_rub_amount(amount_minor, plans)
+        topup = wallet.create_topup(telegram_id, amount_minor, stars)
+        await message.answer_invoice(
+            title=t("wallet.topup_invoice_title"),
+            description=t(
+                "wallet.topup_invoice_description",
+                amount=format_rubles(amount_minor),
+            ),
+            payload=f"jvtop_{topup.id}",
+            provider_token="",
+            currency="XTR",
+            prices=[
+                LabeledPrice(
+                    label=t("wallet.topup_invoice_title"),
+                    amount=topup.stars_amount,
+                )
+            ],
+        )
+    except (ValueError, WalletError, TelegramAPIError):
+        logger.warning("Top-up invoice could not be created")
+        return False
+    return True
+
+
+@router.callback_query(F.data.startswith("topup:"))
+async def topup_navigation(
+    callback: CallbackQuery,
+    plans: tuple[Plan, ...],
+    state: FSMContext,
+    wallet: WalletStore | None = None,
+) -> None:
+    if callback.message is None or callback.message.chat.type != "private":
+        await callback.answer(t("alert.private_chat"), show_alert=True)
+        return
+    if wallet is None:
+        await callback.answer(t("wallet.unavailable"), show_alert=True)
+        return
+    action = (callback.data or "").removeprefix("topup:")
+    if action == "cancel":
+        await state.clear()
+        await callback.answer()
+        account = wallet.account(callback.from_user.id)
+        entries = wallet.history(callback.from_user.id)
+        pending = wallet.pending_withdrawal(callback.from_user.id)
+        await _edit_or_send(
+            callback,
+            wallet_text(account, entries, pending),
+            wallet_keyboard(
+                withdraw_available=(
+                    pending is None
+                    and account.referral_available_minor >= MIN_WITHDRAWAL_MINOR
+                ),
+                withdrawal_pending=pending is not None,
+            ),
+        )
+        return
+    if action == "custom":
+        await state.set_state(TopUpFlow.awaiting_amount)
+        await callback.answer()
+        await _edit_or_send(
+            callback,
+            t("wallet.topup_prompt", minimum=format_rubles(MIN_TOPUP_MINOR)),
+            topup_custom_keyboard(),
+        )
+        return
+    if action.startswith("amount:"):
+        raw_amount = action.removeprefix("amount:")
+        if not raw_amount.isdigit():
+            await callback.answer(t("alert.stale_button_short"), show_alert=True)
+            return
+        amount_minor = int(raw_amount)
+        if not MIN_TOPUP_MINOR <= amount_minor <= 10_000_000:
+            await callback.answer(
+                t("wallet.topup_invalid", minimum=format_rubles(MIN_TOPUP_MINOR)),
+                show_alert=True,
+            )
+            return
+        await callback.answer()
+        if not await _send_topup_invoice(
+            callback.message, wallet, plans, callback.from_user.id, amount_minor
+        ):
+            await callback.message.answer(t("wallet.unavailable"))
+        return
+    await callback.answer(t("alert.stale_button_short"), show_alert=True)
+
+
+@router.message(TopUpFlow.awaiting_amount)
+async def topup_amount_input(
+    message: Message,
+    plans: tuple[Plan, ...],
+    state: FSMContext,
+    wallet: WalletStore | None = None,
+) -> None:
+    if not _private_chat(message):
+        await message.answer(t("alert.private_chat"))
+        return
+    assert message.from_user is not None
+    if (message.text or "").strip().casefold() in {"/cancel", "отмена"}:
+        await state.clear()
+        await message.answer(t("common.cancel"), reply_markup=back_keyboard())
+        return
+    if wallet is None:
+        await state.clear()
+        await message.answer(t("wallet.unavailable"))
+        return
+    amount_minor = _parse_rub_amount(message.text or "")
+    if amount_minor is None:
+        await message.answer(
+            t("wallet.topup_invalid", minimum=format_rubles(MIN_TOPUP_MINOR))
+        )
+        return
+    if amount_minor > 10_000_000:
+        await message.answer(
+            t("wallet.topup_too_large", maximum=format_rubles(10_000_000))
+        )
+        return
+    if amount_minor < MIN_TOPUP_MINOR:
+        await message.answer(
+            t("wallet.topup_invalid", minimum=format_rubles(MIN_TOPUP_MINOR))
+        )
+        return
+    await state.clear()
+    if not await _send_topup_invoice(
+        message, wallet, plans, message.from_user.id, amount_minor
+    ):
+        await message.answer(t("wallet.unavailable"))
+        return
+    await message.answer(
+        t(
+            "wallet.topup_invoice_sent",
+            amount=format_rubles(amount_minor),
+        )
+    )
+
+
+@router.callback_query(F.data.startswith("withdraw:"))
+async def withdraw_navigation(
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    wallet: WalletStore | None = None,
+) -> None:
+    if callback.message is None or callback.message.chat.type != "private":
+        await callback.answer(t("alert.private_chat"), show_alert=True)
+        return
+    if wallet is None:
+        await callback.answer(t("wallet.unavailable"), show_alert=True)
+        return
+    action = (callback.data or "").removeprefix("withdraw:")
+    try:
+        account = wallet.account(callback.from_user.id)
+        pending = wallet.pending_withdrawal(callback.from_user.id)
+    except WalletError:
+        await callback.answer(t("wallet.unavailable"), show_alert=True)
+        return
+    if action == "status":
+        if pending is None:
+            await callback.answer(t("wallet.withdraw_unavailable"), show_alert=True)
+        else:
+            await callback.answer(
+                t(
+                    "wallet.pending_row",
+                    amount=format_rubles(pending.amount_minor),
+                    request_id=pending.id[:8],
+                ),
+                show_alert=True,
+            )
+        return
+    if action == "request":
+        if pending is not None:
+            await callback.answer(
+                t("wallet.withdraw_pending_error"), show_alert=True
+            )
+            return
+        if account.referral_available_minor < MIN_WITHDRAWAL_MINOR:
+            await callback.answer(
+                t(
+                    "wallet.withdraw_minimum",
+                    amount=format_rubles(account.referral_available_minor),
+                ),
+                show_alert=True,
+            )
+            return
+        await callback.answer()
+        await _edit_or_send(
+            callback,
+            withdrawal_text(
+                account.referral_available_minor, settings.support_contact
+            ),
+            withdrawal_confirm_keyboard(account.referral_available_minor),
+        )
+        return
+    if action == "confirm":
+        if pending is not None:
+            await callback.answer(
+                t("wallet.withdraw_pending_error"), show_alert=True
+            )
+            return
+        try:
+            request = wallet.request_withdrawal(
+                callback.from_user.id, account.referral_available_minor
+            )
+        except WithdrawalPending:
+            await callback.answer(
+                t("wallet.withdraw_pending_error"), show_alert=True
+            )
+            return
+        except (WithdrawalUnavailable, InsufficientFunds, WalletError):
+            logger.warning("Withdrawal request could not be created")
+            await callback.answer(
+                t("wallet.withdraw_unavailable"), show_alert=True
+            )
+            return
+        for admin_id in settings.admin_telegram_ids:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    t(
+                        "wallet.withdraw_admin",
+                        request_id=escape(request.id),
+                        telegram_id=callback.from_user.id,
+                        amount=format_rubles(request.amount_minor),
+                        name=escape(callback.from_user.full_name),
+                    ),
+                    parse_mode="HTML",
+                )
+            except TelegramAPIError:
+                logger.warning("Withdrawal admin notification failed")
+        await callback.answer()
+        await _edit_or_send(
+            callback,
+            t(
+                "wallet.withdraw_created",
+                amount=format_rubles(request.amount_minor),
+                request_id=request.id,
+            ),
+            back_keyboard("user:wallet"),
+        )
+        return
+    await callback.answer(t("alert.stale_button_short"), show_alert=True)
+
+
+@router.callback_query(F.data.startswith("pay:balance:"))
+async def pay_plan_with_balance(
+    callback: CallbackQuery,
+    bot: Bot,
+    panel: RemnawaveClient,
+    settings: Settings,
+    plans: tuple[Plan, ...],
+    orders: OrderStore,
+    wallet: WalletStore | None = None,
+) -> None:
+    async with _balance_purchase_lock:
+        await _pay_plan_with_balance(
+            callback, bot, panel, settings, plans, orders, wallet
+        )
+
+
+async def _pay_plan_with_balance(
+    callback: CallbackQuery,
+    bot: Bot,
+    panel: RemnawaveClient,
+    settings: Settings,
+    plans: tuple[Plan, ...],
+    orders: OrderStore,
+    wallet: WalletStore | None,
+) -> None:
+    if callback.message is None or callback.message.chat.type != "private":
+        await callback.answer(t("alert.private_chat"), show_alert=True)
+        return
+    if callback.from_user.id in settings.admin_telegram_ids:
+        await callback.answer(t("alert.stale_button_short"), show_alert=True)
+        return
+    if wallet is None:
+        await callback.answer(t("wallet.unavailable"), show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 4 or not parts[3].isdigit():
+        await callback.answer(t("plans.invalid_invoice"), show_alert=True)
+        return
+    plan = _stars_plan(
+        plans,
+        parts[2],
+        include_traffic=settings.traffic_plans_enabled,
+        sellable_only=True,
+    )
+    term = plan.term_for(int(parts[3])) if plan is not None else None
+    if plan is None or term is None:
+        await callback.answer(t("plans.invalid_invoice"), show_alert=True)
+        return
+    try:
+        user = await _load_user(callback.from_user.id, panel)
+        account = wallet.account(callback.from_user.id)
+    except (PanelError, WalletError) as error:
+        logger.warning(
+            "Balance purchase pre-check failed (%s)", type(error).__name__
+        )
+        await callback.answer(t("wallet.payment_blocked"), show_alert=True)
+        return
+    if (
+        user is not None and user.status not in {"ACTIVE", "LIMITED"}
+    ) or (user is None and settings.panel_internal_squad_uuid is None):
+        await callback.answer(t("plans.purchase_blocked"), show_alert=True)
+        return
+    if account.balance_minor < term.price_rub_minor:
+        await callback.answer(
+            t(
+                "wallet.insufficient",
+                required=format_rubles(term.price_rub_minor),
+                balance=format_rubles(account.balance_minor),
+            ),
+            show_alert=True,
+        )
+        return
+    try:
+        latest = orders.latest_for_user(callback.from_user.id)
+        if (
+            latest is not None
+            and latest.plan_code == plan.code
+            and latest.term_days == term.days
+            and latest.status
+            in {PAID, FULFILLING, FULFILLED, FULFILLMENT_REVIEW}
+            and _order_is_recent(latest)
+        ):
+            await callback.answer(
+                t("wallet.payment_applied"), show_alert=True
+            )
+            return
+        order = orders.create_order(
+            callback.from_user.id, plan, term
+        )
+        changed = wallet.pay_order(
+            order.id, callback.from_user.id, term.price_rub_minor
+        )
+        if not changed:
+            await callback.answer(
+                t("wallet.payment_applied"), show_alert=True
+            )
+            return
+        if not orders.claim_fulfillment(order.id):
+            raise WalletConflict("Order fulfillment is unavailable")
+    except InsufficientFunds:
+        await callback.answer(
+            t(
+                "wallet.insufficient",
+                required=format_rubles(term.price_rub_minor),
+                balance=format_rubles(account.balance_minor),
+            ),
+            show_alert=True,
+        )
+        return
+    except (OrderError, WalletError, sqlite3.Error):
+        logger.warning("Balance order could not be recorded")
+        await callback.answer(t("wallet.payment_blocked"), show_alert=True)
+        return
+    order_term = _order_plan_term(plan, order)
+    try:
+        if order_term is None:
+            raise OrderConflict("Paid order no longer matches the catalog")
+        updated = await _fulfill_order(
+            callback.from_user.id, plan, order_term, panel, settings
+        )
+        orders.mark_fulfilled(order.id)
+    except (PanelError, OrderError, sqlite3.Error):
+        logger.warning("Balance order requires manual fulfillment review")
+        try:
+            orders.mark_fulfillment_review(order.id)
+        except (OrderError, sqlite3.Error):
+            logger.warning("Balance order review state could not be saved")
+        await callback.answer()
+        await _edit_or_send(
+            callback, t("plans.paid_review"), back_keyboard("user:wallet")
+        )
+        return
+    if order.rub_price_minor is not None:
+        try:
+            reward = wallet.reward_referral_purchase(
+                order.id, callback.from_user.id, order.rub_price_minor
+            )
+            await _notify_referral_reward(bot, reward, topup=False)
+        except (WalletError, sqlite3.Error):
+            logger.warning("Referral purchase reward could not be recorded")
+    await callback.answer()
+    await _edit_or_send(
+        callback,
+        _payment_success_text(plan, order_term, updated),
+        back_keyboard("user:wallet"),
+    )
+
+
 @router.callback_query(F.data.startswith("checkout:"))
 async def choose_payment_method(
     callback: CallbackQuery,
@@ -3917,11 +4380,26 @@ async def validate_stars_pre_checkout(
     settings: Settings,
     plans: tuple[Plan, ...],
     orders: OrderStore,
+    wallet: WalletStore | None = None,
 ) -> None:
     valid = False
     error_message = t("plans.invalid_invoice")
     payload = query.invoice_payload
-    if payload.startswith("jvpay_"):
+    if payload.startswith("jvtop_"):
+        topup_id = payload.removeprefix("jvtop_")
+        try:
+            if wallet is not None:
+                topup = wallet.topup(topup_id)
+                valid = (
+                    topup.telegram_id == query.from_user.id
+                    and topup.status == "PENDING"
+                    and topup.provider_payment_id is None
+                    and query.currency == "XTR"
+                    and query.total_amount == topup.stars_amount
+                )
+        except (TopupNotFound, WalletError, sqlite3.Error):
+            logger.warning("Top-up pre-checkout could not be validated")
+    elif payload.startswith("jvpay_"):
         order_id = payload.removeprefix("jvpay_")
         try:
             order = orders.get(order_id)
@@ -3976,6 +4454,81 @@ async def validate_stars_pre_checkout(
         logger.warning("Stars pre-checkout approval could not be delivered")
 
 
+async def _fulfill_order(
+    telegram_id: int,
+    plan: Plan,
+    order_term: tuple[int, int],
+    panel: RemnawaveClient,
+    settings: Settings,
+) -> PanelUser:
+    duration_days, _ = order_term
+    user = await _load_user(telegram_id, panel)
+    if user is None:
+        if settings.panel_internal_squad_uuid is None:
+            raise PanelAccessDenied("Panel squad is not configured")
+        return await panel.create_user(
+            telegram_id,
+            duration_days,
+            settings.panel_internal_squad_uuid,
+            tag=plan.panel_tag,
+            traffic_limit_gb=plan.traffic_limit_gb,
+            permanent_traffic=plan.permanent_traffic,
+            traffic_limit_strategy=plan.traffic_limit_strategy,
+        )
+    if user.status not in {"ACTIVE", "LIMITED"}:
+        raise OrderConflict("Subscription is no longer eligible for extension")
+    return await panel.apply_paid_plan(
+        user,
+        duration_days,
+        plan.traffic_limit_gb,
+        permanent_traffic=plan.permanent_traffic,
+        tag=plan.panel_tag,
+        traffic_limit_strategy=plan.traffic_limit_strategy,
+    )
+
+
+def _payment_success_text(
+    plan: Plan, order_term: tuple[int, int], updated: PanelUser
+) -> str:
+    duration_days, _ = order_term
+    if plan.permanent_traffic:
+        return t(
+            "plans.payment_success_traffic",
+            gb=plan.traffic_limit_gb,
+        )
+    if plan.traffic_limit_gb is not None:
+        return t(
+            "plans.payment_success_traffic_limited",
+            gb=plan.traffic_limit_gb,
+            expires=_expiry_text(updated),
+        )
+    return t(
+        "plans.payment_success",
+        days=duration_days,
+        expires=_expiry_text(updated),
+    )
+
+
+async def _notify_referral_reward(
+    bot: Bot, reward, *, topup: bool
+) -> None:
+    if reward is None:
+        return
+    event = t(
+        "referral.reward_topup_event" if topup else "referral.reward_purchase_event",
+        percent=reward.percent,
+    )
+    await _notify_referrer(
+        bot,
+        reward.referrer_id,
+        t(
+            "referral.reward_notice",
+            amount=format_rubles(reward.amount_minor),
+            event=event,
+        ),
+    )
+
+
 @router.message(F.successful_payment)
 async def process_stars_payment(
     message: Message,
@@ -3984,11 +4537,15 @@ async def process_stars_payment(
     settings: Settings,
     plans: tuple[Plan, ...],
     orders: OrderStore,
+    wallet: WalletStore | None = None,
 ) -> None:
     if message.from_user is None or message.successful_payment is None:
         return
     payment = message.successful_payment
     payload = payment.invoice_payload
+    if payload.startswith("jvtop_"):
+        await _process_topup_payment(message, bot, wallet, settings, payload)
+        return
     order_id = payload.removeprefix("jvpay_") if payload.startswith("jvpay_") else ""
     if not order_id:
         logger.warning("Successful Stars payment had an unknown invoice payload")
@@ -4029,31 +4586,9 @@ async def process_stars_payment(
             or payment.total_amount != order.amount_minor
         ):
             raise OrderConflict("Paid order no longer matches the catalog")
-        duration_days, _ = order_term
-        user = await _load_user(message.from_user.id, panel)
-        if user is None:
-            if settings.panel_internal_squad_uuid is None:
-                raise PanelAccessDenied("Panel squad is not configured")
-            updated = await panel.create_user(
-                message.from_user.id,
-                duration_days,
-                settings.panel_internal_squad_uuid,
-                tag=plan.panel_tag,
-                traffic_limit_gb=plan.traffic_limit_gb,
-                permanent_traffic=plan.permanent_traffic,
-                traffic_limit_strategy=plan.traffic_limit_strategy,
-            )
-        elif user.status in {"ACTIVE", "LIMITED"}:
-            updated = await panel.apply_paid_plan(
-                user,
-                duration_days,
-                plan.traffic_limit_gb,
-                permanent_traffic=plan.permanent_traffic,
-                tag=plan.panel_tag,
-                traffic_limit_strategy=plan.traffic_limit_strategy,
-            )
-        else:
-            raise OrderConflict("Subscription is no longer eligible for extension")
+        updated = await _fulfill_order(
+            message.from_user.id, plan, order_term, panel, settings
+        )
         orders.mark_fulfilled(order.id)
     except (PanelError, OrderError, sqlite3.Error):
         logger.warning("Paid Stars order requires manual fulfillment review")
@@ -4063,24 +4598,69 @@ async def process_stars_payment(
             logger.warning("Paid Stars order review state could not be saved")
         await message.answer(t("plans.paid_review"))
         return
-    if plan.permanent_traffic:
-        success_text = t(
-            "plans.payment_success_traffic",
-            gb=plan.traffic_limit_gb,
+    if wallet is not None and order.rub_price_minor is not None:
+        try:
+            reward = wallet.reward_referral_purchase(
+                order.id, message.from_user.id, order.rub_price_minor
+            )
+            await _notify_referral_reward(bot, reward, topup=False)
+        except (WalletError, sqlite3.Error):
+            logger.warning("Referral purchase reward could not be recorded")
+    await message.answer(
+        _payment_success_text(plan, order_term, updated), parse_mode="HTML"
+    )
+
+
+async def _process_topup_payment(
+    message: Message,
+    bot: Bot,
+    wallet: WalletStore | None,
+    settings: Settings,
+    payload: str,
+) -> None:
+    if message.from_user is None or message.successful_payment is None:
+        return
+    payment = message.successful_payment
+    topup_id = payload.removeprefix("jvtop_")
+    if wallet is None or not topup_id:
+        logger.warning("Top-up payment storage is unavailable")
+        await _notify_payment_admins(bot, settings, "topup")
+        await message.answer(t("wallet.topup_review"))
+        return
+    try:
+        existing = wallet.topup(topup_id)
+        if existing.telegram_id != message.from_user.id:
+            raise TopupConflict("Payment owner does not match top-up")
+        topup, changed, reward = wallet.confirm_topup(
+            topup_id,
+            provider_payment_id=payment.telegram_payment_charge_id,
+            amount_minor=payment.total_amount,
+            currency=payment.currency,
         )
-    elif plan.traffic_limit_gb is not None:
-        success_text = t(
-            "plans.payment_success_traffic_limited",
-            gb=plan.traffic_limit_gb,
-            expires=_expiry_text(updated),
-        )
+    except (TopupNotFound, TopupConflict, WalletError, sqlite3.Error):
+        logger.warning("Confirmed top-up could not be recorded")
+        await _notify_payment_admins(bot, settings, topup_id)
+        await message.answer(t("wallet.topup_review"))
+        return
+    if not changed:
+        return
+    try:
+        account = wallet.account(message.from_user.id)
+    except WalletError:
+        account_balance = topup.amount_minor
     else:
-        success_text = t(
-            "plans.payment_success",
-            days=duration_days,
-            expires=_expiry_text(updated),
+        account_balance = account.balance_minor
+    await message.answer(
+        t(
+            "wallet.topup_success",
+            amount=format_rubles(topup.amount_minor),
+            balance=format_rubles(account_balance),
         )
-    await message.answer(success_text, parse_mode="HTML")
+    )
+    try:
+        await _notify_referral_reward(bot, reward, topup=True)
+    except TelegramAPIError:
+        logger.warning("Top-up referral notification delivery failed")
 
 
 @router.message(F.refunded_payment)
@@ -4089,10 +4669,48 @@ async def process_stars_refund_update(
     bot: Bot,
     settings: Settings,
     orders: OrderStore,
+    wallet: WalletStore | None = None,
 ) -> None:
     payment = message.refunded_payment
     if payment is None:
         return
+    if wallet is not None:
+        try:
+            topup = wallet.topup_by_payment_id(
+                payment.telegram_payment_charge_id
+            )
+        except (WalletError, sqlite3.Error):
+            logger.warning("Top-up refund lookup failed")
+            topup = None
+        if topup is not None:
+            if (
+                payment.currency != "XTR"
+                or payment.total_amount != topup.stars_amount
+            ):
+                logger.warning("Telegram Stars top-up refund details do not match")
+                return
+            try:
+                changed = wallet.refund_topup(topup.id)
+            except (WalletError, sqlite3.Error):
+                logger.warning("Telegram Stars top-up refund could not be recorded")
+                return
+            if changed:
+                for admin_id in settings.admin_telegram_ids:
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            t("wallet.refund_admin", request_id=escape(topup.id)),
+                            parse_mode="HTML",
+                        )
+                    except TelegramAPIError:
+                        logger.warning("Top-up refund notification failed")
+                try:
+                    await bot.send_message(
+                        topup.telegram_id, t("wallet.refund_user_notice")
+                    )
+                except TelegramAPIError:
+                    logger.warning("Top-up refund notification failed")
+            return
     try:
         order = orders.get_by_payment_id(payment.telegram_payment_charge_id)
         if order is None:
@@ -4265,6 +4883,13 @@ async def main() -> None:
         await panel.close()
         await bot.session.close()
         raise SystemExit(2) from error
+    try:
+        wallet = WalletStore(settings.state_db_path or "bot-state.sqlite3")
+    except (OSError, WalletError, sqlite3.Error) as error:
+        logger.error("Cannot start without wallet storage: %s", error)
+        await panel.close()
+        await bot.session.close()
+        raise SystemExit(2) from error
     configure_screens(prefs)
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.errors.register(_handle_stale_callback_query_error)
@@ -4329,6 +4954,7 @@ async def main() -> None:
             prefs=prefs,
             tickets=tickets,
             orders=orders,
+            wallet=wallet,
             allowed_updates=dispatcher.resolve_used_update_types(),
         )
     except TelegramAPIError as error:
