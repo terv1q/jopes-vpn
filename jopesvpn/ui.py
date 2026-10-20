@@ -33,8 +33,7 @@ from jopesvpn.timezones import (
 from jopesvpn.wallet import (
     MIN_TOPUP_MINOR,
     MIN_WITHDRAWAL_MINOR,
-    WalletAccount,
-    WalletEntry,
+    PaymentTransaction,
     WithdrawalRequest,
 )
 
@@ -275,8 +274,8 @@ def home_keyboard(
             1,
             [
                 InlineKeyboardButton(
-                    text=t("common.subscription"),
-                    callback_data="user:subscription",
+                    text=t("common.cabinet"),
+                    callback_data="user:cabinet",
                 )
             ],
         )
@@ -291,7 +290,6 @@ def more_keyboard() -> InlineKeyboardMarkup:
     return keyboard(
         [
             [(t("common.cabinet"), "user:cabinet")],
-            [(t("common.subscription"), "user:subscription")],
             [(t("common.devices"), "user:devices")],
             [(t("common.stats"), "user:stats")],
             [(t("common.plans"), "user:plans")],
@@ -599,7 +597,9 @@ def admin_documents_keyboard() -> InlineKeyboardMarkup:
 
 def cabinet_keyboard(page_url: str | None = None) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = [
-        [(t("common.subscription"), "user:subscription")],
+        [(t("wallet.topup_button"), "user:topup")],
+        [(t("wallet.open_button"), "user:wallet")],
+        [(t("common.cooperation"), "user:referrals")],
         [(t("common.more"), "user:more")],
         [(t("common.help"), "user:help")],
         [(t("common.refresh"), "user:cabinet")],
@@ -1055,7 +1055,7 @@ def stats_keyboard() -> InlineKeyboardMarkup:
         [
             [
                 (t("common.devices"), "user:devices"),
-                (t("common.subscription"), "user:subscription"),
+                (t("common.cabinet"), "user:cabinet"),
             ],
             [(t("common.refresh"), "user:stats")],
             [(t("common.back"), "user:back"), (t("common.menu"), "user:home")],
@@ -1111,6 +1111,23 @@ def referral_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def withdrawal_action_keyboard(request_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=t("wallet.withdraw_mark_paid"),
+                    callback_data=f"withdrawal:paid:{request_id}",
+                ),
+                InlineKeyboardButton(
+                    text=t("wallet.withdraw_reject"),
+                    callback_data=f"withdrawal:reject:{request_id}",
+                ),
+            ]
+        ]
+    )
+
+
 def referral_text(stats: dict[str, int], invite_url: str) -> str:
     return "\n\n".join(
         [
@@ -1147,63 +1164,21 @@ def referral_text(stats: dict[str, int], invite_url: str) -> str:
     )
 
 
-WALLET_KIND_KEYS = {
-    "TOPUP": "wallet.kind_topup",
-    "PURCHASE": "wallet.kind_purchase",
-    "REFERRAL": "wallet.kind_referral",
-    "TOPUP_REFUND": "wallet.kind_topup_refund",
-    "REFERRAL_TOPUP_REFUND": "wallet.kind_referral_refund",
-    "WITHDRAWAL": "wallet.kind_withdrawal",
-}
-
-
-def _entry_moment(entry: WalletEntry) -> str:
+def _payment_moment(created_at: str) -> str:
     try:
-        moment = datetime.fromisoformat(entry.created_at)
+        moment = datetime.fromisoformat(created_at)
     except ValueError:
-        return entry.created_at[:10]
+        return created_at[:10]
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=UTC)
     return format_datetime(moment, current_utc_offset())
 
 
-def wallet_entry_text(entry: WalletEntry) -> str:
-    label = t(WALLET_KIND_KEYS.get(entry.kind, "wallet.kind_other"))
-    if entry.balance_delta_minor:
-        delta = entry.balance_delta_minor
-        sign = "+" if delta > 0 else "−"
-        amount = format_rubles(abs(delta))
-    elif entry.referral_delta_minor:
-        delta = entry.referral_delta_minor
-        sign = "+" if delta > 0 else "−"
-        amount = format_rubles(abs(delta))
-    else:
-        sign = "−"
-        amount = format_rubles(entry.amount_minor)
-    return t(
-        "wallet.history_row",
-        label=escape(label),
-        amount=f"{sign}{amount}",
-        date=_entry_moment(entry),
-    )
-
-
 def wallet_text(
-    account: WalletAccount,
-    entries: list[WalletEntry],
+    payments: list[PaymentTransaction],
     pending: WithdrawalRequest | None,
 ) -> str:
-    balance_rows = [
-        t("wallet.balance_row", amount=format_rubles(account.balance_minor)),
-        t(
-            "wallet.referral_row",
-            amount=format_rubles(account.referral_earned_minor),
-        ),
-        t(
-            "wallet.withdrawable_row",
-            amount=format_rubles(account.referral_available_minor),
-        ),
-    ]
+    balance_rows = []
     if pending is not None:
         balance_rows.append(
             t(
@@ -1212,14 +1187,52 @@ def wallet_text(
                 request_id=pending.id[:8],
             )
         )
-    history_rows = [wallet_entry_text(entry) for entry in entries]
+    history_rows = []
+    for payment in payments:
+        amount = (
+            f"{payment.amount_paid_minor} ⭐ "
+            f"({format_rubles(payment.rub_amount_minor)})"
+            if payment.currency == "XTR"
+            else format_rubles(payment.rub_amount_minor)
+        )
+        purpose_key = {
+            "topup": "wallet.receipt_topup",
+            "subscription": "wallet.receipt_subscription",
+            "subscription_refund": "wallet.history_subscription_refund",
+            "topup_bonus": "wallet.history_bonus",
+            "balance_adjustment": "wallet.history_adjustment",
+            "withdrawal": "wallet.history_withdrawal",
+        }.get(payment.purpose, "wallet.history_adjustment")
+        status_key = {
+            "SUCCESS": "wallet.history_success",
+            "CONFIRMED": "wallet.history_confirmed",
+            "REVIEW": "wallet.history_review",
+            "REFUNDED": "wallet.history_refunded",
+        }.get(payment.status, "wallet.history_confirmed")
+        method_key = {
+            "telegram_stars": "wallet.receipt_method_stars",
+            "wallet": "wallet.receipt_method_balance",
+            "manual": "wallet.receipt_method_manual",
+            "admin": "wallet.history_method_admin",
+            "wallet_bonus": "wallet.history_method_bonus",
+        }.get(payment.method)
+        method = t(method_key) if method_key is not None else escape(payment.method)
+        history_rows.append(
+            f"• {t(purpose_key)} · {amount} · {method} · {t(status_key)}\n"
+            f"  {_payment_moment(payment.created_at)} · "
+            f"ID: <code>{escape(payment.id)}</code>"
+        )
     if not history_rows:
         history_rows = [t("wallet.history_empty")]
     return "\n\n".join(
         [
             _heading(t("wallet.title")),
-            _box(t("wallet.balance_title"), balance_rows),
-            _box(t("wallet.history_title"), history_rows),
+            *(
+                [_box(t("wallet.balance_title"), balance_rows)]
+                if balance_rows
+                else []
+            ),
+            _box(t("wallet.payment_history_title"), history_rows),
             t("wallet.note"),
         ]
     )
@@ -1340,6 +1353,33 @@ def topup_custom_keyboard() -> InlineKeyboardMarkup:
                 )
             ]
         ]
+    )
+
+
+def topup_methods_keyboard(stars: int) -> InlineKeyboardMarkup:
+    return keyboard(
+        [
+            [(t("wallet.pay_stars", stars=stars), "topup:pay:stars")],
+            [(t("common.cancel"), "topup:cancel")],
+        ]
+    )
+
+
+def payment_receipt_text(
+    *,
+    operation_id: str,
+    operation: str,
+    amount: str,
+    method: str,
+    result: str,
+) -> str:
+    return t(
+        "wallet.receipt",
+        operation_id=operation_id,
+        operation=operation,
+        amount=amount,
+        method=method,
+        result=result,
     )
 
 
@@ -1813,6 +1853,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
             [(t("ticket.admin_button"), "ticket:admin:list")],
             [(t("admin.logs"), "admin:logs")],
             [(t("admin.status"), "admin:status")],
+            [(t("admin.wallet_menu"), "admin:wallet")],
             [(t("docs.admin_menu"), "admin:docs")],
             [(t("admin.broadcast"), "admin:broadcast")],
             [(t("common.menu"), "user:home")],
@@ -1825,6 +1866,26 @@ def broadcast_keyboard() -> InlineKeyboardMarkup:
         [
             [(t("admin.broadcast_send"), "admin:broadcast:send")],
             [(t("common.cancel"), "admin:broadcast:cancel")],
+        ]
+    )
+
+
+def wallet_admin_confirm_keyboard(action: str) -> InlineKeyboardMarkup:
+    return keyboard(
+        [
+            [(t("common.confirm"), f"admin:wallet:confirm-{action}")],
+            [(t("common.cancel"), "admin:wallet:cancel")],
+        ]
+    )
+
+
+def wallet_admin_keyboard() -> InlineKeyboardMarkup:
+    return keyboard(
+        [
+            [(t("admin.wallet_adjust_button"), "admin:wallet:adjust")],
+            [(t("admin.wallet_bonus_button"), "admin:wallet:bonus")],
+            [(t("admin.wallet_payment_lookup"), "admin:wallet:find")],
+            [(t("common.back"), "admin:home")],
         ]
     )
 
@@ -2416,6 +2477,7 @@ def cabinet_text(
     user: PanelUser | None,
     *,
     telegram_id: int,
+    balance_minor: int | None = None,
     devices_count: int | None = None,
     support: str | None = None,
     panel_error: bool = False,
@@ -2425,6 +2487,10 @@ def cabinet_text(
         account_rows = [
             t("cabinet.status_row", status=t("status.no_connection")),
         ]
+        if balance_minor is not None:
+            account_rows.append(
+                t("wallet.balance_row", amount=format_rubles(balance_minor))
+            )
         return "\n\n".join(
             [
                 f"<b>{t('cabinet.title')}</b>",
@@ -2446,6 +2512,10 @@ def cabinet_text(
             access_rows.append(t("cabinet.trial_available"))
         access_rows.append(t("cabinet.plans_hint"))
         account_rows = [t("cabinet.status_row", status=t("status.none"))]
+        if balance_minor is not None:
+            account_rows.append(
+                t("wallet.balance_row", amount=format_rubles(balance_minor))
+            )
         return "\n\n".join(
             [
                 f"<b>{t('cabinet.title')}</b>",
@@ -2459,6 +2529,10 @@ def cabinet_text(
             ]
         )
     account_rows = [t("cabinet.status_row", status=status_text(user))]
+    if balance_minor is not None:
+        account_rows.append(
+            t("wallet.balance_row", amount=format_rubles(balance_minor))
+        )
     subscription_rows = []
     tariff = tariff_text(user)
     if tariff is not None:

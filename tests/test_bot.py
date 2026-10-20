@@ -2895,9 +2895,10 @@ class PreferencesTests(unittest.TestCase):
             store.mark_free_daily_report_sent(1001, "2026-01-01")
             self.assertEqual(store.pending_free_daily_reports(), [])
 
-    def test_referral_start_is_first_touch_and_rejects_self_referral(self) -> None:
+    def test_referral_link_registers_existing_user_and_keeps_first_referrer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = PreferencesStore(Path(directory) / "state.sqlite3")
+            self.assertFalse(store.register_start(1002))
             self.assertTrue(store.register_start(1002, 1001))
             self.assertFalse(store.register_start(1002, 2001))
             self.assertEqual(store.referral_for(1002), 1001)

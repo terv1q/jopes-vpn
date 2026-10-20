@@ -209,6 +209,7 @@ class FreeAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(panel.reactivations, 1)
         self.assertEqual(panel.user.status, "ACTIVE")
         self.assertEqual(len(bot.messages), 1)
+        self.assertIn("Суточная квота FREE обновлена", bot.messages[0][1])
         self.assertIn("Использовано: 500 Б", bot.messages[0][1])
 
     async def test_panel_repair_error_does_not_stop_processing_cycle(self) -> None:

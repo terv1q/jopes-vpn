@@ -3,12 +3,12 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+from typing import cast
 
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import FSInputFile, InputMediaPhoto, Message
 
 from jopesvpn.preferences import PreferencesError, PreferencesStore
-
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,8 @@ BANNER_FILES = {
     "home": "home.jpg",
     "cabinet": "cabinet.jpg",
     "connect": "connect.jpg",
-    "subscription": "subscription.jpg",
+    "subscription": "purchase_success.png",
+    "purchase_success": "purchase_success.png",
     "devices": "devices.jpg",
     "stats": "stats.jpg",
     "plans": "plans.jpg",
@@ -36,13 +37,13 @@ USER_BANNERS = {
     "setup": "home",
     "more": "home",
     "about": "support",
-    "cabinet": "cabinet",
-    "profile": "cabinet",
+    "cabinet": "purchase_success",
+    "profile": "purchase_success",
     "wallet": "cabinet",
     "topup": "plans",
     "connect": "connect",
-    "subscription": "subscription",
-    "key": "subscription",
+    "subscription": "purchase_success",
+    "key": "purchase_success",
     "devices": "devices",
     "stats": "stats",
     "referrals": "stats",
@@ -196,7 +197,8 @@ async def _edit_photo(
                 ),
                 reply_markup=markup,
             )
-            _remember_file_id(prefs, name, sent)
+            if not isinstance(sent, bool):
+                _remember_file_id(prefs, name, cast(Message, sent))
             return True
         except TelegramBadRequest as error:
             if "message is not modified" in str(error):
@@ -235,7 +237,7 @@ async def edit_screen(
                 logger.warning("Banner navigation context could not be read")
         name = banner_for_callback(f"user:{target}") or "home"
     if getattr(message, "photo", None) is not None:
-        if _can_use_banner(name, prefs, text):
+        if name is not None and _can_use_banner(name, prefs, text):
             if await _edit_photo(message, name, prefs, strip_heading(text), markup):
                 return
             if await _answer_photo(message, name, prefs, strip_heading(text), markup):
@@ -244,7 +246,7 @@ async def edit_screen(
         await message.answer(text, reply_markup=markup, parse_mode="HTML")
         await _delete_old_screen(message)
         return
-    if _can_use_banner(name, prefs, text):
+    if name is not None and _can_use_banner(name, prefs, text):
         caption = strip_heading(text)
         if await _answer_photo(message, name, prefs, caption, markup):
             await _delete_old_screen(message)
@@ -268,9 +270,10 @@ async def answer_screen(
     """Send a new screen message, with a banner photo when possible."""
     prefs = prefs if prefs is not None else _default_store
     name = banner
-    if _can_use_banner(name, prefs, text):
-        if await _answer_photo(
-            message, name, prefs, strip_heading(text), markup
-        ):
-            return
+    if (
+        name is not None
+        and _can_use_banner(name, prefs, text)
+        and await _answer_photo(message, name, prefs, strip_heading(text), markup)
+    ):
+        return
     await message.answer(text, reply_markup=markup, parse_mode="HTML")

@@ -6,7 +6,7 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
-from jopesvpn.ticket_portal import TicketPortalApp
+from jopesvpn.ticket_portal import TicketPortalApp, _sanitize_post_html
 from jopesvpn.tickets import TicketStore
 
 
@@ -40,8 +40,15 @@ class TicketPortalTests(unittest.TestCase):
         cookie: str = "",
         remote_ip: str = "172.30.50.20",
         real_ip: str = "203.0.113.10",
+        origin: str = "",
+        content_type: str = "application/x-www-form-urlencoded",
+        raw_payload: bytes | None = None,
     ) -> tuple[str, dict[str, str], str]:
-        payload = urlencode(fields or {}).encode("utf-8")
+        payload = (
+            raw_payload
+            if raw_payload is not None
+            else urlencode(fields or {}).encode("utf-8")
+        )
         parsed_path = urlsplit(path)
         status: list[str] = []
         headers: dict[str, str] = {}
@@ -54,12 +61,14 @@ class TicketPortalTests(unittest.TestCase):
             "REQUEST_METHOD": method,
             "PATH_INFO": parsed_path.path,
             "QUERY_STRING": parsed_path.query,
-            "CONTENT_TYPE": "application/x-www-form-urlencoded",
+            "CONTENT_TYPE": content_type,
             "CONTENT_LENGTH": str(len(payload)),
             "wsgi.input": BytesIO(payload),
             "REMOTE_ADDR": remote_ip,
             "HTTP_X_REAL_IP": real_ip,
             "HTTP_COOKIE": cookie,
+            "HTTP_HOST": "support.example",
+            "HTTP_ORIGIN": origin,
         }
         body = b"".join(self.app(environ, start_response)).decode("utf-8")
         return status[0], headers, body
@@ -124,6 +133,97 @@ class TicketPortalTests(unittest.TestCase):
             )
         )
         self.assertFalse(self.store.close(self.ticket_id, "admin"))
+
+    def test_channel_post_editor_requires_admin_and_sanitizes_rich_text(self) -> None:
+        status, _, _ = self.request("/support/admin/posts")
+        self.assertTrue(status.startswith("401"))
+        _, headers, _ = self.request(
+            "/support/admin",
+            method="POST",
+            fields={"password": "a-secure-test-password-long"},
+        )
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        status, _, page = self.request("/support/admin/posts", cookie=cookie)
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("contenteditable=\"true\"", page)
+        self.assertIn("multipart/form-data", page)
+
+        status, _, _ = self.request(
+            "/support/admin/posts",
+            method="POST",
+            fields={
+                "action": "create_post",
+                "body_html": "<b>Новость</b><script>alert(1)</script>",
+                "button_label_0": "Подключиться",
+                "button_url_0": "https://example.com/connect",
+                "button_row_0": "1",
+            },
+            cookie=cookie,
+            origin="https://support.example",
+        )
+        self.assertTrue(status.startswith("303"))
+        post = self.store.channel_posts()[0]
+        self.assertEqual(post["status"], "queued")
+        saved = self.store.get_channel_post(post["post_id"])
+        self.assertEqual(saved["body_html"], "<b>Новость</b>alert(1)")
+        self.assertEqual(
+            _sanitize_post_html('<a href="javascript:alert(1)">bad</a>'),
+            "bad",
+        )
+
+    def test_channel_post_publication_and_click_are_single_use(self) -> None:
+        post_id = self.store.create_channel_post(
+            900,
+            "<b>News</b>",
+            [[{"text": "Open", "url": "https://example.com"}]],
+            None,
+            None,
+        )
+        self.assertTrue(self.store.claim_channel_post_preview(post_id))
+        self.assertFalse(self.store.claim_channel_post_preview(post_id))
+        self.assertTrue(self.store.finish_channel_post_preview(post_id, 22))
+        self.assertTrue(self.store.claim_channel_post_publication(post_id, 900))
+        self.assertFalse(self.store.claim_channel_post_publication(post_id, 900))
+        self.assertTrue(self.store.finish_channel_post_publication(post_id, 31))
+        self.assertEqual(
+            self.store.record_channel_post_click(post_id, 0, 101, "Tester"),
+            {"text": "Open", "url": "https://example.com"},
+        )
+
+    def test_channel_post_editor_accepts_valid_image_upload(self) -> None:
+        _, headers, _ = self.request(
+            "/support/admin",
+            method="POST",
+            fields={"password": "a-secure-test-password-long"},
+        )
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        boundary = "jopes-test-boundary"
+        payload = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="action"\r\n\r\n'
+            "create_post\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="body_html"\r\n\r\n'
+            "Фото пост\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="photo"; filename="post.png"\r\n'
+            "Content-Type: image/png\r\n\r\n"
+        ).encode("utf-8") + b"\x89PNG\r\n\x1a\n" + (
+            f"\r\n--{boundary}--\r\n"
+        ).encode("ascii")
+        status, _, _ = self.request(
+            "/support/admin/posts",
+            method="POST",
+            cookie=cookie,
+            origin="https://support.example",
+            content_type=f"multipart/form-data; boundary={boundary}",
+            raw_payload=payload,
+        )
+        self.assertTrue(status.startswith("303"))
+        saved = self.store.get_channel_post(self.store.channel_posts()[0]["post_id"])
+        assert saved is not None
+        self.assertEqual(saved["photo_mime"], "image/png")
+        self.assertEqual(saved["photo_data"], b"\x89PNG\r\n\x1a\n")
 
     def test_admin_pages_require_valid_session_and_password(self) -> None:
         status, _, _ = self.request(

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 from jopesvpn.plans import Plan, PlanTerm, term_savings
-
 
 PENDING = "PENDING"
 PAID = "PAID"
@@ -299,6 +299,7 @@ class OrderStore:
         amount_minor: int,
         currency: str,
         now: str | None = None,
+        payment_recorder: Callable[[sqlite3.Connection, Order], None] | None = None,
     ) -> tuple[Order, bool]:
         if not provider or not provider_payment_id:
             raise ValueError("Provider and provider payment ID are required")
@@ -352,8 +353,11 @@ class OrderStore:
             updated = connection.execute(
                 "SELECT * FROM orders WHERE id = ?", (order.id,)
             ).fetchone()
+            confirmed_order = _order(updated)
+            if payment_recorder is not None:
+                payment_recorder(connection, confirmed_order)
             connection.commit()
-        return _order(updated), True
+        return confirmed_order, True
 
     def claim_fulfillment(self, order_id: str) -> bool:
         with closing(self._connect()) as connection:

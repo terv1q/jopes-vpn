@@ -31,6 +31,7 @@ class Settings:
     subscription_page_url: str | None = None
     ticket_portal_url: str | None = None
     state_db_path: str | None = None
+    owner_telegram_id: int | None = None
 
     @property
     def trial_channel_url(self) -> str:
@@ -101,6 +102,13 @@ class Settings:
             raise ConfigurationError("BOT_ADMIN_IDS must contain positive Telegram IDs")
         if not admin_ids:
             raise ConfigurationError("BOT_ADMIN_IDS must contain at least one administrator")
+        raw_owner_id = os.environ.get("BOT_OWNER_ID", "").strip()
+        try:
+            owner_id = int(raw_owner_id) if raw_owner_id else None
+        except ValueError as error:
+            raise ConfigurationError("BOT_OWNER_ID must be an integer") from error
+        if owner_id is not None and owner_id not in admin_ids:
+            raise ConfigurationError("BOT_OWNER_ID must be included in BOT_ADMIN_IDS")
 
         squad_uuid = (
             os.environ.get("PANEL_INTERNAL_SQUAD_UUID", "").strip() or None
@@ -218,4 +226,5 @@ class Settings:
             subscription_page_url=subscription_page_url,
             ticket_portal_url=ticket_portal_url,
             state_db_path=state_db_path,
+            owner_telegram_id=owner_id,
         )

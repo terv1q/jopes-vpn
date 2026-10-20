@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for renewed Hysteria 2 TLS certificates
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -161,6 +161,49 @@ class PreferencesStore:
                 )
                 connection.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS campaign_button_clicks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        campaign TEXT NOT NULL,
+                        protocol TEXT NOT NULL,
+                        telegram_id INTEGER NOT NULL,
+                        first_name TEXT NOT NULL,
+                        last_name TEXT,
+                        username TEXT,
+                        clicked_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        completed_at TEXT
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS announcement_posts (
+                        campaign TEXT PRIMARY KEY,
+                        status TEXT NOT NULL,
+                        owner_id INTEGER NOT NULL,
+                        preview_message_id INTEGER,
+                        photo_file_id TEXT,
+                        channel_message_id INTEGER,
+                        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    )
+                    """
+                )
+                announcement_columns = {
+                    row["name"]
+                    for row in connection.execute(
+                        "PRAGMA table_info(announcement_posts)"
+                    ).fetchall()
+                }
+                if "preview_message_id" not in announcement_columns:
+                    connection.execute(
+                        "ALTER TABLE announcement_posts "
+                        "ADD COLUMN preview_message_id INTEGER"
+                    )
+                if "photo_file_id" not in announcement_columns:
+                    connection.execute(
+                        "ALTER TABLE announcement_posts ADD COLUMN photo_file_id TEXT"
+                    )
+                connection.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS connection_log_endpoints (
                         panel_user_id INTEGER NOT NULL,
                         telegram_id INTEGER,
@@ -378,7 +421,7 @@ class PreferencesStore:
         try:
             with closing(self._connect()) as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                inserted = connection.execute(
+                connection.execute(
                     """
                     INSERT INTO user_preferences
                         (
@@ -389,9 +432,9 @@ class PreferencesStore:
                     ON CONFLICT(telegram_id) DO NOTHING
                     """,
                     (telegram_id,),
-                ).rowcount == 1
+                )
                 added_referral = False
-                if inserted and referrer_id is not None and referrer_id != telegram_id:
+                if referrer_id is not None and referrer_id != telegram_id:
                     cursor = connection.execute(
                         """
                         INSERT OR IGNORE INTO referrals (referred_id, referrer_id)
@@ -576,6 +619,325 @@ class PreferencesStore:
         except sqlite3.Error as error:
             raise PreferencesError("Cannot read referral") from error
         return None if row is None else int(row["referrer_id"])
+
+    def log_campaign_click(
+        self,
+        campaign: str,
+        protocol: str,
+        telegram_id: int,
+        first_name: str,
+        last_name: str | None,
+        username: str | None,
+    ) -> int:
+        try:
+            with closing(self._connect()) as connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO campaign_button_clicks (
+                        campaign, protocol, telegram_id, first_name, last_name,
+                        username
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        campaign,
+                        protocol,
+                        telegram_id,
+                        first_name,
+                        last_name,
+                        username,
+                    ),
+                )
+                connection.commit()
+                return int(cursor.lastrowid)
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot log campaign button click") from error
+
+    def pending_campaign_click(self, telegram_id: int) -> tuple[int, str] | None:
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    """
+                    SELECT id, protocol FROM campaign_button_clicks
+                    WHERE telegram_id = ? AND completed_at IS NULL
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (telegram_id,),
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot read pending campaign click") from error
+        return None if row is None else (int(row["id"]), str(row["protocol"]))
+
+    def finish_campaign_click(self, click_id: int) -> None:
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute(
+                    """
+                    UPDATE campaign_button_clicks SET completed_at = datetime('now')
+                    WHERE id = ? AND completed_at IS NULL
+                    """,
+                    (click_id,),
+                )
+                connection.commit()
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot finish campaign button click") from error
+
+    def begin_announcement_preview(self, campaign: str, owner_id: int) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO announcement_posts (campaign, status, owner_id)
+                    VALUES (?, 'preview_pending', ?)
+                    """,
+                    (campaign, owner_id),
+                )
+                cursor = connection.execute(
+                    """
+                    UPDATE announcement_posts
+                    SET status = 'preview_sending', owner_id = ?,
+                        updated_at = datetime('now')
+                    WHERE campaign = ? AND status = 'preview_pending'
+                    """,
+                    (owner_id, campaign),
+                )
+                connection.commit()
+                return cursor.rowcount == 1
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot start announcement preview") from error
+
+    def finish_announcement_preview(
+        self, campaign: str, preview_message_id: int
+    ) -> None:
+        try:
+            with closing(self._connect()) as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE announcement_posts SET status = 'awaiting_approval',
+                        preview_message_id = ?, updated_at = datetime('now')
+                    WHERE campaign = ? AND status = 'preview_sending'
+                    """,
+                    (preview_message_id, campaign),
+                )
+                connection.commit()
+                if cursor.rowcount != 1:
+                    raise PreferencesError("Announcement preview state changed")
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot finish announcement preview") from error
+
+    def retry_announcement_preview(self, campaign: str) -> None:
+        self._set_announcement_status(campaign, "preview_sending", "preview_pending")
+
+    def recover_announcement_image_state(self, campaign: str) -> None:
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute(
+                    """
+                    UPDATE announcement_posts SET status = 'awaiting_approval',
+                        updated_at = datetime('now')
+                    WHERE campaign = ? AND status = 'awaiting_image'
+                    """,
+                    (campaign,),
+                )
+                connection.execute(
+                    """
+                    UPDATE announcement_posts SET status = 'awaiting_approval',
+                        photo_file_id = NULL, updated_at = datetime('now')
+                    WHERE campaign = ? AND status = 'preview_image_sending'
+                    """,
+                    (campaign,),
+                )
+                connection.commit()
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot recover announcement image state") from error
+
+    def begin_announcement_image(self, campaign: str, owner_id: int) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE announcement_posts SET status = 'awaiting_image',
+                        updated_at = datetime('now')
+                    WHERE campaign = ? AND owner_id = ?
+                        AND status = 'awaiting_approval'
+                    """,
+                    (campaign, owner_id),
+                )
+                connection.commit()
+                return cursor.rowcount == 1
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot request announcement image") from error
+
+    def cancel_announcement_image(self, campaign: str, owner_id: int) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE announcement_posts SET status = 'awaiting_approval',
+                        updated_at = datetime('now')
+                    WHERE campaign = ? AND owner_id = ? AND status = 'awaiting_image'
+                    """,
+                    (campaign, owner_id),
+                )
+                connection.commit()
+                return cursor.rowcount == 1
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot cancel announcement image request") from error
+
+    def claim_announcement_image(
+        self, campaign: str, owner_id: int, photo_file_id: str
+    ) -> int | None:
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    """
+                    UPDATE announcement_posts SET status = 'preview_image_sending',
+                        photo_file_id = ?, updated_at = datetime('now')
+                    WHERE campaign = ? AND owner_id = ? AND status = 'awaiting_image'
+                    """,
+                    (photo_file_id, campaign, owner_id),
+                )
+                row = connection.execute(
+                    """
+                    SELECT preview_message_id FROM announcement_posts
+                    WHERE campaign = ? AND status = 'preview_image_sending'
+                    """,
+                    (campaign,),
+                ).fetchone()
+                if (
+                    cursor.rowcount != 1
+                    or row is None
+                    or row["preview_message_id"] is None
+                ):
+                    connection.rollback()
+                    return None
+                connection.commit()
+                return int(row["preview_message_id"])
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot save announcement image") from error
+
+    def finish_announcement_image(
+        self, campaign: str, preview_message_id: int
+    ) -> None:
+        try:
+            with closing(self._connect()) as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE announcement_posts SET status = 'awaiting_approval',
+                        preview_message_id = ?, updated_at = datetime('now')
+                    WHERE campaign = ? AND status = 'preview_image_sending'
+                    """,
+                    (preview_message_id, campaign),
+                )
+                connection.commit()
+                if cursor.rowcount != 1:
+                    raise PreferencesError("Announcement image state changed")
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot finish announcement image update") from error
+
+    def retry_announcement_image(self, campaign: str) -> None:
+        self._set_announcement_status(
+            campaign, "preview_image_sending", "awaiting_image"
+        )
+
+    def announcement_photo(self, campaign: str) -> str | None:
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT photo_file_id FROM announcement_posts WHERE campaign = ?",
+                    (campaign,),
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot read announcement image") from error
+        return None if row is None else row["photo_file_id"]
+
+    def claim_announcement_publication(
+        self, campaign: str, owner_id: int
+    ) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    """
+                    UPDATE announcement_posts SET status = 'publishing',
+                        updated_at = datetime('now')
+                    WHERE campaign = ? AND owner_id = ? AND status = 'awaiting_approval'
+                    """,
+                    (campaign, owner_id),
+                )
+                connection.commit()
+                return cursor.rowcount == 1
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot claim announcement publication") from error
+
+    def finish_announcement_publication(
+        self, campaign: str, channel_message_id: int
+    ) -> None:
+        try:
+            with closing(self._connect()) as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE announcement_posts SET status = 'published',
+                        channel_message_id = ?, updated_at = datetime('now')
+                    WHERE campaign = ? AND status = 'publishing'
+                    """,
+                    (channel_message_id, campaign),
+                )
+                connection.commit()
+                if cursor.rowcount != 1:
+                    raise PreferencesError("Announcement publication is not pending")
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot finish announcement publication") from error
+
+    def retry_announcement_publication(self, campaign: str) -> None:
+        self._set_announcement_status(campaign, "publishing", "awaiting_approval")
+
+    def cancel_announcement(self, campaign: str, owner_id: int) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE announcement_posts SET status = 'cancelled',
+                        updated_at = datetime('now')
+                    WHERE campaign = ? AND owner_id = ? AND status = 'awaiting_approval'
+                    """,
+                    (campaign, owner_id),
+                )
+                connection.commit()
+                return cursor.rowcount == 1
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot cancel announcement") from error
+
+    def announcement_status(self, campaign: str) -> str | None:
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT status FROM announcement_posts WHERE campaign = ?",
+                    (campaign,),
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot read announcement status") from error
+        return None if row is None else str(row["status"])
+
+    def _set_announcement_status(
+        self, campaign: str, previous: str, current: str
+    ) -> None:
+        try:
+            with closing(self._connect()) as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE announcement_posts SET status = ?,
+                        updated_at = datetime('now')
+                    WHERE campaign = ? AND status = ?
+                    """,
+                    (current, campaign, previous),
+                )
+                connection.commit()
+                if cursor.rowcount != 1:
+                    raise PreferencesError("Announcement state changed")
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot update announcement status") from error
 
     def reserve_referral_reward(
         self,

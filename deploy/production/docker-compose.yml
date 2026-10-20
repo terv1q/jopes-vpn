@@ -166,6 +166,7 @@ services:
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       BOT_ADMIN_IDS: ${BOT_ADMIN_IDS}
+      BOT_OWNER_ID: ${BOT_OWNER_ID:-}
       PANEL_API_URL: https://${PANEL_DOMAIN}
       PANEL_API_TOKEN: ${PANEL_API_TOKEN}
       PANEL_CA_BUNDLE: ${PANEL_CA_BUNDLE}
@@ -233,6 +234,8 @@ volumes:
     name: jopesvpn-production-caddy-config
   bot-data:
     name: jopesvpn-production-bot-data
+  hysteria2-certs:
+    name: jopesvpn-production-hysteria2-certs
 
 networks:
   backend:

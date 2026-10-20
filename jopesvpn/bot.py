@@ -2,24 +2,30 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import re
 import sqlite3
 import sys
 import time
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from html import escape
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+)
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
+    BufferedInputFile,
     CallbackQuery,
     ErrorEvent,
     InlineKeyboardButton,
@@ -42,6 +48,16 @@ from jopesvpn.admin import (
 )
 from jopesvpn.admin import (
     router as admin_router,
+)
+from jopesvpn.announcements import (
+    ANNOUNCEMENT_CALLBACK_PREFIX,
+    ANNOUNCEMENT_CAMPAIGN,
+    ANNOUNCEMENT_TEXT,
+    CAMPAIGN_START_PROTOCOLS,
+    PROTOCOL_LABELS,
+    connection_keyboard,
+    image_prompt_keyboard,
+    preview_keyboard,
 )
 from jopesvpn.config import ConfigurationError, Settings
 from jopesvpn.connection_logs import connection_log_loop
@@ -146,6 +162,7 @@ from jopesvpn.ui import (
     more_text,
     no_subscription_text,
     payment_methods_keyboard,
+    payment_receipt_text,
     plan_terms_keyboard,
     plans_keyboard,
     plans_text,
@@ -166,12 +183,14 @@ from jopesvpn.ui import (
     timezone_text,
     topup_amount_keyboard,
     topup_custom_keyboard,
+    topup_methods_keyboard,
     topup_text,
     trial_keyboard,
     trial_text,
     troubleshooting_text,
     wallet_keyboard,
     wallet_text,
+    withdrawal_action_keyboard,
     withdrawal_confirm_keyboard,
     withdrawal_text,
 )
@@ -179,6 +198,7 @@ from jopesvpn.wallet import (
     MIN_TOPUP_MINOR,
     MIN_WITHDRAWAL_MINOR,
     InsufficientFunds,
+    PaymentTransaction,
     TopupConflict,
     TopupNotFound,
     WalletConflict,
@@ -190,6 +210,12 @@ from jopesvpn.wallet import (
 
 logger = logging.getLogger(__name__)
 router = Router(name="user")
+BUILD_CODE = "JV-FREEWALLET-R4"
+PROCESS_STARTED_AT = time.monotonic()
+
+
+class AnnouncementFlow(StatesGroup):
+    awaiting_image = State()
 
 
 @router.message(
@@ -212,10 +238,530 @@ async def user_section_command_entry(
     settings: Settings,
     plans: tuple[Plan, ...],
     prefs: PreferencesStore | None = None,
+    wallet: WalletStore | None = None,
     state: FSMContext | None = None,
 ) -> None:
     await user_section_command(
-        message, bot, panel, settings, plans, prefs=prefs, state=state
+        message,
+        bot,
+        panel,
+        settings,
+        plans,
+        prefs=prefs,
+        wallet=wallet,
+        state=state,
+    )
+
+
+@router.message(Command("ping"))
+async def ping_command(message: Message) -> None:
+    uptime_seconds = max(0, int(time.monotonic() - PROCESS_STARTED_AT))
+    days, remainder = divmod(uptime_seconds, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+    await message.answer(
+        f"{BUILD_CODE} · uptime {days}d {hours:02}:{minutes:02}:{seconds:02}"
+    )
+
+
+def _announcement_owner_id(settings: Settings) -> int:
+    return settings.owner_telegram_id or min(settings.admin_telegram_ids)
+
+
+async def _send_announcement_preview(
+    bot: Bot, settings: Settings, prefs: PreferencesStore
+) -> None:
+    owner_id = _announcement_owner_id(settings)
+    try:
+        prefs.recover_announcement_image_state(ANNOUNCEMENT_CAMPAIGN)
+        if not prefs.begin_announcement_preview(ANNOUNCEMENT_CAMPAIGN, owner_id):
+            return
+        bot_user = await bot.get_me()
+        if not bot_user.username:
+            raise RuntimeError("Bot username is unavailable")
+        await bot.send_message(
+            chat_id=owner_id,
+            text="Предпросмотр поста для официального канала:",
+        )
+        preview = await bot.send_message(
+            chat_id=owner_id,
+            text=ANNOUNCEMENT_TEXT,
+            reply_markup=preview_keyboard(bot_user.username),
+        )
+        prefs.finish_announcement_preview(
+            ANNOUNCEMENT_CAMPAIGN, preview.message_id
+        )
+    except (TelegramAPIError, PreferencesError, RuntimeError):
+        logger.exception("Protocol announcement preview could not be delivered")
+        try:
+            prefs.retry_announcement_preview(ANNOUNCEMENT_CAMPAIGN)
+        except PreferencesError:
+            logger.exception("Protocol announcement preview state could not be reset")
+
+
+@router.callback_query(
+    F.data.startswith(f"{ANNOUNCEMENT_CALLBACK_PREFIX}:")
+)
+async def protocol_announcement_approval(
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    prefs: PreferencesStore,
+    state: FSMContext | None = None,
+) -> None:
+    owner_id = _announcement_owner_id(settings)
+    if callback.from_user.id != owner_id:
+        await callback.answer(
+            "Одобрить публикацию может только владелец.", show_alert=True
+        )
+        return
+    action = (callback.data or "").removeprefix(
+        f"{ANNOUNCEMENT_CALLBACK_PREFIX}:"
+    )
+    if action == "image":
+        if state is None:
+            await callback.answer(
+                "Не удалось открыть загрузку изображения.", show_alert=True
+            )
+            return
+        try:
+            requested = prefs.begin_announcement_image(
+                ANNOUNCEMENT_CAMPAIGN, owner_id
+            )
+        except PreferencesError:
+            logger.exception("Announcement image upload could not be started")
+            await callback.answer(
+                "Не удалось открыть загрузку изображения.", show_alert=True
+            )
+            return
+        if not requested:
+            await callback.answer("Предпросмотр уже обработан.", show_alert=True)
+            return
+        await state.set_state(AnnouncementFlow.awaiting_image)
+        try:
+            await bot.send_message(
+                owner_id,
+                "Пришлите изображение одним сообщением. После загрузки появится "
+                "предпросмотр поста с картинкой.",
+                reply_markup=image_prompt_keyboard(),
+            )
+        except TelegramAPIError:
+            await state.clear()
+            try:
+                prefs.cancel_announcement_image(
+                    ANNOUNCEMENT_CAMPAIGN, owner_id
+                )
+            except PreferencesError:
+                logger.exception("Announcement image request could not be cancelled")
+            await callback.answer(
+                "Не удалось запросить изображение.", show_alert=True
+            )
+            return
+        await callback.answer()
+        return
+    if action == "image_cancel":
+        try:
+            cancelled = prefs.cancel_announcement_image(
+                ANNOUNCEMENT_CAMPAIGN, owner_id
+            )
+        except PreferencesError:
+            logger.exception("Announcement image request could not be cancelled")
+            await callback.answer("Не удалось отменить загрузку.", show_alert=True)
+            return
+        if not cancelled:
+            await callback.answer("Загрузка уже обработана.", show_alert=True)
+            return
+        if state is not None:
+            await state.clear()
+        await callback.answer("Продолжаем без картинки.")
+        if isinstance(callback.message, Message):
+            await callback.message.edit_reply_markup(reply_markup=None)
+        return
+    if action == "cancel":
+        try:
+            cancelled = prefs.cancel_announcement(ANNOUNCEMENT_CAMPAIGN, owner_id)
+        except PreferencesError:
+            logger.exception("Protocol announcement could not be cancelled")
+            await callback.answer("Не удалось сохранить отмену.", show_alert=True)
+            return
+        if not cancelled:
+            await callback.answer("Предпросмотр уже обработан.", show_alert=True)
+            return
+        await callback.answer("Публикация отменена.")
+        if isinstance(callback.message, Message):
+            await callback.message.edit_reply_markup(reply_markup=None)
+        if state is not None:
+            await state.clear()
+        return
+    if action != "publish":
+        await callback.answer("Кнопка устарела.", show_alert=True)
+        return
+    try:
+        claimed = prefs.claim_announcement_publication(
+            ANNOUNCEMENT_CAMPAIGN, owner_id
+        )
+    except PreferencesError:
+        logger.exception("Protocol announcement could not be claimed for publication")
+        await callback.answer("Не удалось подготовить публикацию.", show_alert=True)
+        return
+    if not claimed:
+        await callback.answer("Публикация уже обработана.", show_alert=True)
+        return
+    try:
+        bot_user = await bot.get_me()
+        if not bot_user.username:
+            raise RuntimeError("Bot username is unavailable")
+        photo_file_id = prefs.announcement_photo(ANNOUNCEMENT_CAMPAIGN)
+    except (TelegramAPIError, PreferencesError, RuntimeError):
+        logger.exception("Protocol announcement publication failed")
+        try:
+            prefs.retry_announcement_publication(ANNOUNCEMENT_CAMPAIGN)
+        except PreferencesError:
+            logger.exception("Protocol announcement publication state is uncertain")
+        await callback.answer(
+            "Не удалось опубликовать. Проверьте права бота в канале.",
+            show_alert=True,
+        )
+        return
+    try:
+        if photo_file_id is None:
+            posted = await bot.send_message(
+                chat_id=f"@{settings.trial_channel_username}",
+                text=ANNOUNCEMENT_TEXT,
+                reply_markup=connection_keyboard(bot_user.username),
+            )
+        else:
+            posted = await bot.send_photo(
+                chat_id=f"@{settings.trial_channel_username}",
+                photo=photo_file_id,
+                caption=ANNOUNCEMENT_TEXT,
+                reply_markup=connection_keyboard(bot_user.username),
+            )
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.exception("Telegram rejected protocol announcement publication")
+        try:
+            prefs.retry_announcement_publication(ANNOUNCEMENT_CAMPAIGN)
+        except PreferencesError:
+            logger.exception("Protocol announcement publication state is uncertain")
+        await callback.answer(
+            "Telegram отклонил публикацию. Проверьте права бота в канале.",
+            show_alert=True,
+        )
+        return
+    except TelegramAPIError:
+        logger.exception("Protocol announcement publication result is uncertain")
+        await callback.answer(
+            "Проверьте канал: Telegram не подтвердил отправку. "
+            "Не нажимайте повторно.",
+            show_alert=True,
+        )
+        return
+    try:
+        prefs.finish_announcement_publication(
+            ANNOUNCEMENT_CAMPAIGN, posted.message_id
+        )
+    except PreferencesError:
+        logger.exception("Published announcement status could not be saved")
+        await callback.answer(
+            "Пост отправлен, но его статус не сохранился. Не нажимайте повторно.",
+            show_alert=True,
+        )
+        return
+    await callback.answer("Пост опубликован.")
+    if isinstance(callback.message, Message):
+        await callback.message.edit_reply_markup(reply_markup=None)
+    if state is not None:
+        await state.clear()
+    try:
+        await bot.send_message(owner_id, "Пост опубликован в официальном канале.")
+    except TelegramAPIError:
+        logger.warning("Publication confirmation could not be delivered to owner")
+
+
+def _channel_post_keyboard(
+    post_id: int,
+    buttons: list[list[dict[str, str]]],
+    bot_username: str,
+    *,
+    approval: bool,
+) -> InlineKeyboardMarkup:
+    markup = []
+    button_index = 0
+    for row in buttons:
+        markup_row = []
+        for button in row:
+            markup_row.append(
+                InlineKeyboardButton(
+                    text=button["text"],
+                    url=f"https://t.me/{bot_username}?start=cp_{post_id}_{button_index}",
+                    style="success",
+                )
+            )
+            button_index += 1
+        if markup_row:
+            markup.append(markup_row)
+    if approval:
+        markup.append(
+            [
+                InlineKeyboardButton(
+                    text="Опубликовать",
+                    callback_data=f"channelpost:{post_id}:approve",
+                    style="success",
+                ),
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data=f"channelpost:{post_id}:cancel",
+                    style="danger",
+                ),
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=markup)
+
+
+async def channel_post_preview_loop(bot: Bot, tickets: TicketStore) -> None:
+    try:
+        recovered = tickets.recover_channel_post_previews()
+        if recovered:
+            logger.warning("Recovered stale channel post previews")
+    except TicketStoreError:
+        logger.exception("Stale channel post previews could not be recovered")
+    while True:
+        try:
+            posts = tickets.pending_channel_posts()
+            bot_username = ""
+            if posts:
+                bot_user = await bot.get_me()
+                if not bot_user.username:
+                    raise RuntimeError("Bot username is unavailable")
+                bot_username = bot_user.username
+            for post in posts:
+                post_id = int(post["post_id"])
+                if not tickets.claim_channel_post_preview(post_id):
+                    continue
+                try:
+                    buttons = json.loads(post["buttons_json"])
+                    markup = _channel_post_keyboard(
+                        post_id, buttons, bot_username, approval=True
+                    )
+                    if post["photo_data"] is not None:
+                        posted = await bot.send_photo(
+                            chat_id=int(post["owner_id"]),
+                            photo=BufferedInputFile(
+                                bytes(post["photo_data"]),
+                                filename={
+                                    "image/png": "post.png",
+                                    "image/jpeg": "post.jpg",
+                                    "image/webp": "post.webp",
+                                }.get(post["photo_mime"], "post.jpg"),
+                            ),
+                            caption=post["body_html"] or None,
+                            parse_mode="HTML" if post["body_html"] else None,
+                            reply_markup=markup,
+                        )
+                    else:
+                        posted = await bot.send_message(
+                            chat_id=int(post["owner_id"]),
+                            text=post["body_html"],
+                            parse_mode="HTML",
+                            reply_markup=markup,
+                        )
+                    tickets.finish_channel_post_preview(post_id, posted.message_id)
+                except (TelegramAPIError, TicketStoreError, ValueError, TypeError):
+                    logger.exception("Channel post preview delivery failed")
+                    try:
+                        tickets.retry_channel_post_preview(post_id)
+                    except TicketStoreError:
+                        logger.exception("Channel post preview retry could not be saved")
+        except (TelegramAPIError, TicketStoreError, RuntimeError):
+            logger.exception("Channel post queue could not be processed")
+        await asyncio.sleep(5)
+
+
+@router.callback_query(F.data.startswith("channelpost:"))
+async def channel_post_approval(
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    tickets: TicketStore,
+) -> None:
+    match = re.fullmatch(
+        r"channelpost:([1-9][0-9]{0,18}):(approve|cancel)", callback.data or ""
+    )
+    if match is None:
+        await callback.answer("Кнопка устарела.", show_alert=True)
+        return
+    post_id = int(match.group(1))
+    owner_id = _announcement_owner_id(settings)
+    if callback.from_user.id != owner_id:
+        await callback.answer("Одобрить пост может только владелец.", show_alert=True)
+        return
+    if match.group(2) == "cancel":
+        try:
+            cancelled = tickets.cancel_channel_post(post_id, owner_id)
+        except TicketStoreError:
+            logger.exception("Channel post cancellation could not be saved")
+            await callback.answer("Не удалось отменить пост.", show_alert=True)
+            return
+        if not cancelled:
+            await callback.answer("Пост уже обработан.", show_alert=True)
+            return
+        await callback.answer("Пост отменён.")
+        if isinstance(callback.message, Message):
+            await callback.message.edit_reply_markup(reply_markup=None)
+        return
+    claimed = False
+    try:
+        if not tickets.claim_channel_post_publication(post_id, owner_id):
+            await callback.answer("Пост уже обработан.", show_alert=True)
+            return
+        claimed = True
+        post = tickets.get_channel_post(post_id)
+        bot_user = await bot.get_me()
+        if post is None or not bot_user.username:
+            raise RuntimeError("Channel post data is unavailable")
+        buttons = json.loads(post["buttons_json"])
+        markup = _channel_post_keyboard(
+            post_id, buttons, bot_user.username, approval=False
+        )
+    except (TelegramAPIError, TicketStoreError, RuntimeError, ValueError, TypeError):
+        if claimed:
+            try:
+                tickets.retry_channel_post_publication(post_id)
+            except TicketStoreError:
+                logger.exception("Channel post retry state could not be saved")
+        logger.exception("Channel post could not be prepared")
+        await callback.answer("Не удалось подготовить пост.", show_alert=True)
+        return
+    try:
+        if post["photo_data"] is not None:
+            published = await bot.send_photo(
+                chat_id=f"@{settings.trial_channel_username}",
+                photo=BufferedInputFile(
+                    bytes(post["photo_data"]),
+                    filename={
+                        "image/png": "post.png",
+                        "image/jpeg": "post.jpg",
+                        "image/webp": "post.webp",
+                    }.get(post["photo_mime"], "post.jpg"),
+                ),
+                caption=post["body_html"] or None,
+                parse_mode="HTML" if post["body_html"] else None,
+                reply_markup=markup if buttons else None,
+            )
+        else:
+            published = await bot.send_message(
+                chat_id=f"@{settings.trial_channel_username}",
+                text=post["body_html"],
+                parse_mode="HTML",
+                reply_markup=markup if buttons else None,
+            )
+    except (TelegramBadRequest, TelegramForbiddenError):
+        try:
+            tickets.retry_channel_post_publication(post_id)
+        except TicketStoreError:
+            logger.exception("Rejected channel post could not be reopened")
+        logger.exception("Telegram rejected channel post publication")
+        await callback.answer(
+            "Telegram отклонил пост. Проверьте права бота и попробуйте снова.",
+            show_alert=True,
+        )
+        return
+    except TelegramAPIError:
+        logger.exception("Channel post publication result is uncertain")
+        await callback.answer(
+            "Не удалось подтвердить результат. Проверьте канал и не нажимайте повторно.",
+            show_alert=True,
+        )
+        return
+    try:
+        if not tickets.finish_channel_post_publication(
+            post_id, published.message_id
+        ):
+            raise TicketStoreError("Published post status could not be saved")
+    except TicketStoreError:
+        logger.exception("Published channel post status could not be saved")
+        await callback.answer(
+            "Пост отправлен, но статус не сохранился. Не нажимайте повторно.",
+            show_alert=True,
+        )
+        return
+    await callback.answer("Пост опубликован.")
+    if isinstance(callback.message, Message):
+        await callback.message.edit_reply_markup(reply_markup=None)
+
+
+@router.message(AnnouncementFlow.awaiting_image, F.photo)
+async def receive_announcement_image(
+    message: Message,
+    bot: Bot,
+    settings: Settings,
+    prefs: PreferencesStore,
+    state: FSMContext,
+) -> None:
+    owner_id = _announcement_owner_id(settings)
+    if not _private_chat(message):
+        await state.clear()
+        return
+    assert message.from_user is not None
+    if message.from_user.id != owner_id:
+        await state.clear()
+        return
+    assert message.photo is not None
+    try:
+        old_preview_id = prefs.claim_announcement_image(
+            ANNOUNCEMENT_CAMPAIGN, owner_id, message.photo[-1].file_id
+        )
+    except PreferencesError:
+        logger.exception("Announcement image could not be saved")
+        await message.answer("Не удалось сохранить изображение. Попробуйте ещё раз.")
+        return
+    if old_preview_id is None:
+        await state.clear()
+        await message.answer("Загрузка изображения уже завершена или устарела.")
+        return
+    try:
+        bot_user = await bot.get_me()
+        if not bot_user.username:
+            raise RuntimeError("Bot username is unavailable")
+        photo_preview = await bot.send_photo(
+            chat_id=owner_id,
+            photo=message.photo[-1].file_id,
+            caption=ANNOUNCEMENT_TEXT,
+            reply_markup=preview_keyboard(bot_user.username),
+        )
+    except (TelegramAPIError, RuntimeError):
+        logger.exception("Announcement image preview could not be sent")
+        try:
+            prefs.retry_announcement_image(ANNOUNCEMENT_CAMPAIGN)
+        except PreferencesError:
+            logger.exception("Announcement image state could not be reset")
+        await message.answer(
+            "Не удалось показать картинку. Попробуйте отправить её ещё раз."
+        )
+        return
+    try:
+        prefs.finish_announcement_image(
+            ANNOUNCEMENT_CAMPAIGN, photo_preview.message_id
+        )
+    except PreferencesError:
+        logger.exception("Announcement image preview state could not be saved")
+        await message.answer(
+            "Картинка отправлена, но предпросмотр не сохранился. "
+            "Не одобряйте пост до проверки."
+        )
+        return
+    await state.clear()
+    try:
+        await bot.delete_message(owner_id, old_preview_id)
+    except TelegramAPIError:
+        logger.warning("Old text-only announcement preview could not be removed")
+    await message.answer("Картинка добавлена. Проверьте предпросмотр и одобрите пост.")
+
+
+@router.message(AnnouncementFlow.awaiting_image, F.text)
+async def announcement_image_expected(message: Message) -> None:
+    await message.answer(
+        "Отправьте картинку как фото или нажмите «Не добавлять картинку»."
     )
 
 
@@ -225,6 +771,7 @@ async def show_about_command(
     plans: tuple[Plan, ...],
     settings: Settings,
     prefs: PreferencesStore | None = None,
+    wallet: WalletStore | None = None,
 ) -> None:
     if not _private_chat(message):
         await message.answer(t("alert.private_use_start"))
@@ -253,6 +800,7 @@ class TicketFlow(StatesGroup):
 
 class TopUpFlow(StatesGroup):
     awaiting_amount = State()
+    choose_payment = State()
 
 
 class LanguageMiddleware(BaseMiddleware):
@@ -968,6 +1516,7 @@ async def _render_cabinet(
     panel: RemnawaveClient,
     settings: Settings,
     prefs: PreferencesStore | None = None,
+    wallet: WalletStore | None = None,
 ) -> None:
     support = support_url(settings.support_contact)
     try:
@@ -979,6 +1528,11 @@ async def _render_cabinet(
             cabinet_text(
                 None,
                 telegram_id=callback.from_user.id,
+                balance_minor=(
+                    wallet.account(callback.from_user.id).balance_minor
+                    if wallet is not None
+                    else None
+                ),
                 support=settings.support_contact,
                 panel_error=True,
             ),
@@ -998,6 +1552,11 @@ async def _render_cabinet(
         cabinet_text(
             user,
             telegram_id=callback.from_user.id,
+            balance_minor=(
+                wallet.account(callback.from_user.id).balance_minor
+                if wallet is not None
+                else None
+            ),
             devices_count=devices_count,
             support=settings.support_contact,
             trial_available=(
@@ -1188,9 +1747,9 @@ async def _user_screen(
             ),
             about_keyboard(privacy_url, agreement_url),
         )
-    elif screen == "cabinet":
+    elif screen in {"cabinet", "subscription"}:
         await callback.answer()
-        await _render_cabinet(callback, panel, settings, prefs)
+        await _render_cabinet(callback, panel, settings, prefs, wallet)
     elif screen == "connect":
         await callback.answer()
         await _render_connect(callback, panel, settings, prefs)
@@ -1289,7 +1848,7 @@ async def _user_screen(
             return
         try:
             account = wallet.account(callback.from_user.id)
-            entries = wallet.history(callback.from_user.id)
+            payments = wallet.payment_history(callback.from_user.id)
             pending = wallet.pending_withdrawal(callback.from_user.id)
         except WalletError:
             logger.warning("Wallet screen could not be loaded")
@@ -1298,7 +1857,7 @@ async def _user_screen(
         await callback.answer()
         await _edit_or_send(
             callback,
-            wallet_text(account, entries, pending),
+            wallet_text(payments, pending),
             wallet_keyboard(
                 withdraw_available=(
                     pending is None
@@ -1575,16 +2134,9 @@ async def _show_trial(
     if user is not None:
         await _edit_or_send(callback, t("trial.unavailable_generic"), back_keyboard())
         return
-    trial_days = settings.trial_days
-    if prefs is not None:
-        try:
-            if prefs.referral_for(callback.from_user.id) is not None:
-                trial_days += REFERRAL_INVITEE_BONUS_DAYS
-        except PreferencesError:
-            logger.warning("Referral attribution could not be read")
     await _edit_or_send(
         callback,
-        trial_text(trial_days, settings.trial_channel_url),
+        trial_text(settings.trial_days, settings.trial_channel_url),
         trial_keyboard(settings.trial_channel_url),
     )
 
@@ -1641,6 +2193,82 @@ async def _notify_referrer(bot: Bot, telegram_id: int, text: str) -> bool:
         return False
 
 
+async def _show_campaign_connection(
+    target: Message | CallbackQuery,
+    panel: RemnawaveClient,
+    settings: Settings,
+    prefs: PreferencesStore,
+) -> bool:
+    user = target.from_user
+    if user is None:
+        return False
+    try:
+        pending = prefs.pending_campaign_click(user.id)
+    except PreferencesError:
+        logger.warning("Campaign connection choice could not be loaded")
+        return False
+    if pending is None:
+        return False
+    click_id, protocol = pending
+    try:
+        panel_user = await _load_user(user.id, panel)
+    except PanelError as error:
+        logger.warning("Panel request failed (%s)", type(error).__name__)
+        panel_user = None
+        panel_error = True
+    else:
+        panel_error = False
+    page_url = _page_url(panel_user, settings)
+    trial_available = (
+        panel_user is None
+        and not panel_error
+        and await _trial_eligible(user.id, panel, prefs)
+    )
+    _record_navigation(prefs, user.id, "connect")
+    text = connect_text(
+        panel_user,
+        page_url,
+        support=settings.support_contact,
+        panel_error=panel_error,
+        trial_available=trial_available,
+    )
+    label = PROTOCOL_LABELS.get(protocol)
+    if label is not None:
+        if panel_error:
+            text = (
+                f"<b>Подключение: {label}</b>\n\n"
+                "Не получилось проверить подписку. Попробуйте ещё раз позже."
+            )
+        elif _has_access(panel_user):
+            text = (
+                f"<b>Вы выбрали {label}</b>\n\n"
+                "Нажмите «🌐 Открыть страницу подписки» и добавьте подписку "
+                f"в приложение. Затем выберите сервер {label}."
+            )
+        else:
+            text = (
+                f"<b>Вы выбрали {label}</b>\n\n"
+                "Чтобы подключиться, сначала получите доступ. Затем добавьте "
+                "подписку в приложение и выберите сервер "
+                f"{label}."
+            )
+    markup = connect_keyboard(
+        page_url,
+        has_access=_has_access(panel_user),
+        support=support_url(settings.support_contact),
+        trial_available=trial_available,
+    )
+    if isinstance(target, CallbackQuery):
+        await _edit_or_send(target, text, markup)
+    else:
+        await answer_screen(target, text, markup, banner="connect")
+    try:
+        prefs.finish_campaign_click(click_id)
+    except PreferencesError:
+        logger.warning("Campaign connection choice could not be marked complete")
+    return True
+
+
 @router.message(CommandStart())
 async def start(
     message: Message,
@@ -1649,19 +2277,35 @@ async def start(
     settings: Settings,
     state: FSMContext | None = None,
     prefs: PreferencesStore | None = None,
+    wallet: WalletStore | None = None,
+    tickets: TicketStore | None = None,
 ) -> None:
     await _clear_state(state)
     if not _private_chat(message):
         await message.answer(t("alert.private_start"))
         return
+    assert message.from_user is not None
     if prefs is None:
         await message.answer(t("docs.accept_failed"))
         return
     referral_registered = False
     referrer_id: int | None = None
+    campaign_protocol: str | None = None
+    channel_post_click: tuple[int, int] | None = None
     try:
         prefs.reset_navigation(message.from_user.id)
         command_parts = (message.text or "").split(maxsplit=1)
+        if len(command_parts) == 2:
+            start_parameter = command_parts[1].strip()
+            campaign_protocol = CAMPAIGN_START_PROTOCOLS.get(start_parameter)
+            post_click = re.fullmatch(
+                r"cp_([1-9][0-9]{0,18})_([0-7])", start_parameter
+            )
+            if post_click:
+                channel_post_click = (
+                    int(post_click.group(1)),
+                    int(post_click.group(2)),
+                )
         if len(command_parts) == 2 and re.fullmatch(
             r"ref_[1-9][0-9]{0,18}", command_parts[1].strip()
         ):
@@ -1677,10 +2321,38 @@ async def start(
             message.from_user.last_name,
             message.from_user.username,
         )
+        if campaign_protocol is not None:
+            prefs.log_campaign_click(
+                ANNOUNCEMENT_CAMPAIGN,
+                campaign_protocol,
+                message.from_user.id,
+                message.from_user.first_name or "",
+                message.from_user.last_name,
+                message.from_user.username,
+            )
     except (PreferencesError, ValueError):
         logger.warning("Preferences database is unavailable")
+        campaign_protocol = None
     if referral_registered and referrer_id is not None:
         await _notify_referrer(bot, referrer_id, t("referral.new_visit"))
+    if campaign_protocol is not None:
+        person = (
+            f"@{message.from_user.username}"
+            if message.from_user.username
+            else message.from_user.full_name
+        )
+        try:
+            await bot.send_message(
+                _announcement_owner_id(settings),
+                (
+                    "Переход по кнопке подключения из канала\n"
+                    f"Вариант: {PROTOCOL_LABELS[campaign_protocol]}\n"
+                    f"Пользователь: {person}\n"
+                    f"Telegram ID: {message.from_user.id}"
+                ),
+            )
+        except TelegramAPIError:
+            logger.warning("Protocol button click notification could not be delivered")
     try:
         consented = prefs.documents_accepted(
             message.from_user.id, prefs.documents_version()
@@ -1702,6 +2374,49 @@ async def start(
             banner="support",
         )
         return
+    if await _show_campaign_connection(message, panel, settings, prefs):
+        return
+    if channel_post_click is not None and tickets is not None:
+        post_id, button_index = channel_post_click
+        try:
+            button = tickets.record_channel_post_click(
+                post_id,
+                button_index,
+                message.from_user.id,
+                message.from_user.full_name,
+            )
+        except TicketStoreError:
+            logger.exception("Channel post button click could not be recorded")
+            button = None
+        if button is not None:
+            await message.answer(
+                f"Кнопка: {button['text']}\nНажмите ниже, чтобы открыть ссылку.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text=f"Открыть: {button['text']}",
+                                url=button["url"],
+                                style="success",
+                            )
+                        ]
+                    ]
+                ),
+            )
+            try:
+                await bot.send_message(
+                    _announcement_owner_id(settings),
+                    (
+                        "Переход по кнопке поста\n"
+                        f"Пост: #{post_id}\n"
+                        f"Кнопка: {button['text']}\n"
+                        f"Пользователь: {message.from_user.full_name}\n"
+                        f"Telegram ID: {message.from_user.id}"
+                    ),
+                )
+            except TelegramAPIError:
+                logger.warning("Channel post click notification could not be delivered")
+            return
     text, page_url, has_access, trial_available = await _home_view(
         message.from_user.first_name or t("common.friend"),
         message.from_user.id,
@@ -1766,6 +2481,8 @@ async def documents_navigation(
             await callback.answer(t("docs.accept_failed"), show_alert=True)
             return
         await callback.answer(t("docs.accepted", version=current_version))
+        if await _show_campaign_connection(callback, panel, settings, prefs):
+            return
         text, page_url, has_access, trial_available = await _home_view(
             callback.from_user.first_name or t("common.friend"),
             callback.from_user.id,
@@ -1816,6 +2533,7 @@ async def status_command(
     settings: Settings,
     state: FSMContext | None = None,
     prefs: PreferencesStore | None = None,
+    wallet: WalletStore | None = None,
 ) -> None:
     await _clear_state(state)
     if not _private_chat(message):
@@ -1833,6 +2551,11 @@ async def status_command(
         cabinet_text(
             user,
             telegram_id=message.from_user.id,
+            balance_minor=(
+                wallet.account(message.from_user.id).balance_minor
+                if wallet is not None
+                else None
+            ),
             support=settings.support_contact,
         ),
         cabinet_keyboard(_page_url(user, settings)),
@@ -1908,6 +2631,8 @@ async def user_navigation(
     if action == "key":
         action = "subscription"
     elif action == "profile":
+        action = "cabinet"
+    elif action == "subscription":
         action = "cabinet"
     screens = {
         "home",
@@ -3279,6 +4004,7 @@ async def user_section_command(
     settings: Settings,
     plans: tuple[Plan, ...],
     prefs: PreferencesStore | None = None,
+    wallet: WalletStore | None = None,
     state: FSMContext | None = None,
 ) -> None:
     await _clear_state(state)
@@ -3288,7 +4014,7 @@ async def user_section_command(
     assert message.from_user is not None
     command = (message.text or "").split(maxsplit=1)[0].split("@", maxsplit=1)[0]
     screen = command.removeprefix("/").lower()
-    if screen == "account":
+    if screen in {"account", "subscription"}:
         screen = "cabinet"
     if screen == "cooperation":
         screen = "referrals"
@@ -3366,6 +4092,11 @@ async def user_section_command(
                 cabinet_text(
                     user,
                     telegram_id=message.from_user.id,
+                    balance_minor=(
+                        wallet.account(message.from_user.id).balance_minor
+                        if wallet is not None
+                        else None
+                    ),
                     devices_count=devices_count,
                     support=settings.support_contact,
                     trial_available=(
@@ -3435,13 +4166,13 @@ async def user_section_command(
             banner="plans",
         )
     elif screen == "referrals":
-        if prefs is None:
+        if prefs is None or wallet is None:
             await message.answer(t("referral.unavailable"))
             return
         try:
-            stats = prefs.referral_stats(message.from_user.id)
+            summary = wallet.referral_summary(message.from_user.id)
             bot_user = await bot.get_me()
-        except (PreferencesError, TelegramAPIError):
+        except (PreferencesError, WalletError, TelegramAPIError):
             logger.warning("Referral statistics could not be loaded")
             await message.answer(t("referral.unavailable"))
             return
@@ -3451,10 +4182,24 @@ async def user_section_command(
         invite_url = (
             f"https://t.me/{bot_user.username}?start=ref_{message.from_user.id}"
         )
+        stats = {
+            "invited": summary.invited,
+            "activated": summary.activated,
+            "paying": summary.paying,
+            "purchases": summary.purchases,
+            "earned_minor": summary.earned_minor,
+            "available_minor": summary.available_minor,
+        }
         await answer_screen(
             message,
             referral_text(stats, invite_url),
-            referral_keyboard(invite_url),
+            referral_keyboard(
+                referral_share_url(invite_url),
+                withdraw_available=(
+                    summary.available_minor >= MIN_WITHDRAWAL_MINOR
+                    and summary.pending_withdrawal_id is None
+                ),
+            ),
             banner="stats",
         )
 
@@ -3697,6 +4442,7 @@ async def payment_review_loop(
     bot: Bot,
     settings: Settings,
     orders: OrderStore,
+    wallet: WalletStore | None = None,
     *,
     interval_seconds: int = 60,
 ) -> None:
@@ -3730,6 +4476,40 @@ async def payment_review_loop(
                     orders.mark_review_notified(order.id)
                 except (OrderError, sqlite3.Error):
                     logger.warning("Paid order review notice could not be recorded")
+        if wallet is not None and settings.admin_telegram_ids:
+            try:
+                withdrawals = wallet.pending_withdrawal_notifications()
+            except (WalletError, sqlite3.Error):
+                logger.warning("Withdrawal review scan failed")
+                withdrawals = []
+            for request in withdrawals:
+                delivered = True
+                for admin_id in settings.admin_telegram_ids:
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            t(
+                                "wallet.withdraw_admin",
+                                request_id=escape(request.id),
+                                telegram_id=request.telegram_id,
+                                amount=format_rubles(request.amount_minor),
+                                name=str(request.telegram_id),
+                            ),
+                            parse_mode="HTML",
+                            reply_markup=withdrawal_action_keyboard(request.id),
+                        )
+                    except TelegramAPIError:
+                        delivered = False
+                        logger.warning(
+                            "Withdrawal review notification delivery failed"
+                        )
+                if delivered:
+                    try:
+                        wallet.mark_withdrawal_notified(request.id)
+                    except (WalletError, sqlite3.Error):
+                        logger.warning(
+                            "Withdrawal review notification state could not be saved"
+                        )
         await asyncio.sleep(interval_seconds)
 
 
@@ -3798,6 +4578,7 @@ async def topup_navigation(
     if callback.message is None or callback.message.chat.type != "private":
         await callback.answer(t("alert.private_chat"), show_alert=True)
         return
+    assert isinstance(callback.message, Message)
     if wallet is None:
         await callback.answer(t("wallet.unavailable"), show_alert=True)
         return
@@ -3806,11 +4587,11 @@ async def topup_navigation(
         await state.clear()
         await callback.answer()
         account = wallet.account(callback.from_user.id)
-        entries = wallet.history(callback.from_user.id)
+        payments = wallet.payment_history(callback.from_user.id)
         pending = wallet.pending_withdrawal(callback.from_user.id)
         await _edit_or_send(
             callback,
-            wallet_text(account, entries, pending),
+            wallet_text(payments, pending),
             wallet_keyboard(
                 withdraw_available=(
                     pending is None
@@ -3819,6 +4600,23 @@ async def topup_navigation(
                 withdrawal_pending=pending is not None,
             ),
         )
+        return
+    if action == "pay:stars":
+        data = await state.get_data()
+        amount_minor = data.get("topup_amount_minor")
+        if (
+            not isinstance(amount_minor, int)
+            or not MIN_TOPUP_MINOR <= amount_minor <= 10_000_000
+        ):
+            await state.clear()
+            await callback.answer(t("alert.stale_button_short"), show_alert=True)
+            return
+        await state.clear()
+        await callback.answer()
+        if not await _send_topup_invoice(
+            callback.message, wallet, plans, callback.from_user.id, amount_minor
+        ):
+            await callback.message.answer(t("wallet.unavailable"))
         return
     if action == "custom":
         await state.set_state(TopUpFlow.awaiting_amount)
@@ -3841,11 +4639,23 @@ async def topup_navigation(
                 show_alert=True,
             )
             return
+        try:
+            stars = stars_for_rub_amount(amount_minor, plans)
+        except ValueError:
+            await callback.answer(t("wallet.unavailable"), show_alert=True)
+            return
+        await state.update_data(topup_amount_minor=amount_minor)
+        await state.set_state(TopUpFlow.choose_payment)
         await callback.answer()
-        if not await _send_topup_invoice(
-            callback.message, wallet, plans, callback.from_user.id, amount_minor
-        ):
-            await callback.message.answer(t("wallet.unavailable"))
+        await _edit_or_send(
+            callback,
+            t(
+                "wallet.payment_method_prompt",
+                amount=format_rubles(amount_minor),
+                stars=stars,
+            ),
+            topup_methods_keyboard(stars),
+        )
         return
     await callback.answer(t("alert.stale_button_short"), show_alert=True)
 
@@ -3885,17 +4695,21 @@ async def topup_amount_input(
             t("wallet.topup_invalid", minimum=format_rubles(MIN_TOPUP_MINOR))
         )
         return
-    await state.clear()
-    if not await _send_topup_invoice(
-        message, wallet, plans, message.from_user.id, amount_minor
-    ):
+    try:
+        stars = stars_for_rub_amount(amount_minor, plans)
+    except ValueError:
         await message.answer(t("wallet.unavailable"))
         return
+    await state.update_data(topup_amount_minor=amount_minor)
+    await state.set_state(TopUpFlow.choose_payment)
     await message.answer(
         t(
-            "wallet.topup_invoice_sent",
+            "wallet.payment_method_prompt",
             amount=format_rubles(amount_minor),
-        )
+            stars=stars,
+        ),
+        reply_markup=topup_methods_keyboard(stars),
+        parse_mode="HTML",
     )
 
 
@@ -3977,21 +4791,6 @@ async def withdraw_navigation(
                 t("wallet.withdraw_unavailable"), show_alert=True
             )
             return
-        for admin_id in settings.admin_telegram_ids:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    t(
-                        "wallet.withdraw_admin",
-                        request_id=escape(request.id),
-                        telegram_id=callback.from_user.id,
-                        amount=format_rubles(request.amount_minor),
-                        name=escape(callback.from_user.full_name),
-                    ),
-                    parse_mode="HTML",
-                )
-            except TelegramAPIError:
-                logger.warning("Withdrawal admin notification failed")
         await callback.answer()
         await _edit_or_send(
             callback,
@@ -4004,6 +4803,72 @@ async def withdraw_navigation(
         )
         return
     await callback.answer(t("alert.stale_button_short"), show_alert=True)
+
+
+@router.callback_query(F.data.startswith("withdrawal:"))
+async def settle_withdrawal_request(
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    wallet: WalletStore | None = None,
+) -> None:
+    if (
+        callback.message is None
+        or callback.message.chat.type != "private"
+        or callback.from_user.id not in settings.admin_telegram_ids
+    ):
+        await callback.answer(t("admin.command_unavailable"), show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in {"paid", "reject"}:
+        await callback.answer(t("alert.stale_button_short"), show_alert=True)
+        return
+    if wallet is None:
+        await callback.answer(t("wallet.unavailable"), show_alert=True)
+        return
+    try:
+        request, changed = wallet.settle_withdrawal(
+            parts[2], paid=parts[1] == "paid"
+        )
+    except (WalletError, sqlite3.Error):
+        logger.warning("Withdrawal request could not be settled")
+        await callback.answer(t("wallet.withdraw_unavailable"), show_alert=True)
+        return
+    if not changed:
+        await callback.answer(
+            t("wallet.withdraw_already_settled"), show_alert=True
+        )
+        return
+    if parts[1] == "paid":
+        notice = t(
+            "wallet.withdraw_paid_user",
+            amount=format_rubles(request.amount_minor),
+        )
+        try:
+            transaction = wallet.payment_transaction(request.id)
+            if transaction is not None:
+                notice += _receipt_for_transaction(
+                    transaction, operation=t("wallet.receipt_withdrawal")
+                )
+        except WalletError:
+            logger.warning("Withdrawal receipt could not be loaded")
+        result = t("wallet.withdraw_settled")
+    else:
+        notice = t(
+            "wallet.withdraw_rejected_user",
+            amount=format_rubles(request.amount_minor),
+        )
+        result = t("wallet.withdraw_rejected")
+    try:
+        await bot.send_message(request.telegram_id, notice)
+    except TelegramAPIError:
+        logger.warning("Withdrawal status notification failed")
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramAPIError:
+            logger.warning("Withdrawal admin controls could not be removed")
+    await callback.answer(result)
 
 
 @router.callback_query(F.data.startswith("pay:balance:"))
@@ -4034,6 +4899,7 @@ async def _pay_plan_with_balance(
     if callback.message is None or callback.message.chat.type != "private":
         await callback.answer(t("alert.private_chat"), show_alert=True)
         return
+    assert isinstance(callback.message, Message)
     if callback.from_user.id in settings.admin_telegram_ids:
         await callback.answer(t("alert.stale_button_short"), show_alert=True)
         return
@@ -4127,12 +4993,20 @@ async def _pay_plan_with_balance(
             callback.from_user.id, plan, order_term, panel, settings
         )
         orders.mark_fulfilled(order.id)
-    except (PanelError, OrderError, sqlite3.Error):
+        wallet.complete_order_payment(order.id, status="SUCCESS")
+        transaction = wallet.payment_transaction(order.id)
+        if transaction is None:
+            raise WalletError("Successful order payment is missing from history")
+    except (PanelError, OrderError, WalletError, sqlite3.Error):
         logger.warning("Balance order requires manual fulfillment review")
         try:
             orders.mark_fulfillment_review(order.id)
         except (OrderError, sqlite3.Error):
             logger.warning("Balance order review state could not be saved")
+        try:
+            wallet.complete_order_payment(order.id, status="REVIEW")
+        except WalletError:
+            logger.warning("Balance payment review state could not be saved")
         await callback.answer()
         await _edit_or_send(
             callback, t("plans.paid_review"), back_keyboard("user:wallet")
@@ -4147,10 +5021,14 @@ async def _pay_plan_with_balance(
         except (WalletError, sqlite3.Error):
             logger.warning("Referral purchase reward could not be recorded")
     await callback.answer()
-    await _edit_or_send(
-        callback,
-        _payment_success_text(plan, order_term, updated),
-        back_keyboard("user:wallet"),
+    await answer_screen(
+        callback.message,
+        _payment_success_text(plan, order_term, updated)
+        + _receipt_for_transaction(
+            transaction, operation=t("wallet.receipt_subscription")
+        ),
+        back_keyboard("user:cabinet"),
+        banner="purchase_success",
     )
 
 
@@ -4457,7 +5335,7 @@ async def validate_stars_pre_checkout(
 async def _fulfill_order(
     telegram_id: int,
     plan: Plan,
-    order_term: tuple[int, int],
+    order_term: tuple[int, PlanTerm | None],
     panel: RemnawaveClient,
     settings: Settings,
 ) -> PanelUser:
@@ -4488,7 +5366,7 @@ async def _fulfill_order(
 
 
 def _payment_success_text(
-    plan: Plan, order_term: tuple[int, int], updated: PanelUser
+    plan: Plan, order_term: tuple[int, PlanTerm | None], updated: PanelUser
 ) -> str:
     duration_days, _ = order_term
     if plan.permanent_traffic:
@@ -4509,10 +5387,42 @@ def _payment_success_text(
     )
 
 
+def _receipt_amount(transaction: PaymentTransaction) -> str:
+    if transaction.currency == "XTR":
+        return (
+            f"{transaction.amount_paid_minor} ⭐ "
+            f"({format_rubles(transaction.rub_amount_minor)})"
+        )
+    if transaction.amount_paid_minor:
+        return format_rubles(transaction.amount_paid_minor)
+    return format_rubles(transaction.rub_amount_minor)
+
+
+def _receipt_for_transaction(
+    transaction: PaymentTransaction, *, operation: str
+) -> str:
+    method = (
+        t("wallet.receipt_method_stars")
+        if transaction.method == "telegram_stars"
+        else t("wallet.receipt_method_balance")
+        if transaction.method == "wallet"
+        else t("wallet.receipt_method_manual")
+        if transaction.method == "manual"
+        else transaction.method
+    )
+    return payment_receipt_text(
+        operation_id=transaction.id,
+        operation=operation,
+        amount=_receipt_amount(transaction),
+        method=method,
+        result=t("wallet.receipt_result_success"),
+    )
+
+
 async def _notify_referral_reward(
     bot: Bot, reward, *, topup: bool
 ) -> None:
-    if reward is None:
+    if reward is None or reward.amount_minor <= 0:
         return
     event = t(
         "referral.reward_topup_event" if topup else "referral.reward_purchase_event",
@@ -4562,13 +5472,37 @@ async def process_stars_payment(
             provider_payment_id=payment.telegram_payment_charge_id,
             amount_minor=payment.total_amount,
             currency=payment.currency,
+            payment_recorder=(
+                None
+                if wallet is None
+                else lambda connection, paid_order: (
+                    wallet.record_order_payment_locked(
+                        connection,
+                        order_id=paid_order.id,
+                        telegram_id=paid_order.telegram_id,
+                        amount_paid_minor=paid_order.amount_minor,
+                        currency=paid_order.currency,
+                        method="telegram_stars",
+                        external_payment_id=paid_order.provider_payment_id or "",
+                    )
+                )
+            ),
         )
         if not changed or order.status != PAID:
             return
+        if wallet is None:
+            raise WalletError("Payment history is unavailable")
+        transaction = wallet.payment_transaction(order.id)
+        if transaction is None:
+            raise WalletError("Payment history is unavailable")
         if not orders.claim_fulfillment(order.id):
             return
-    except (OrderError, sqlite3.Error):
+    except (OrderError, WalletError, sqlite3.Error):
         logger.warning("Confirmed Stars payment could not be recorded")
+        try:
+            orders.mark_fulfillment_review(order_id)
+        except (OrderError, sqlite3.Error):
+            logger.warning("Paid order review state could not be saved")
         await _notify_payment_admins(bot, settings, order_id)
         await message.answer(t("plans.paid_review"))
         return
@@ -4590,12 +5524,21 @@ async def process_stars_payment(
             message.from_user.id, plan, order_term, panel, settings
         )
         orders.mark_fulfilled(order.id)
-    except (PanelError, OrderError, sqlite3.Error):
+        wallet.complete_order_payment(order.id, status="SUCCESS")
+        transaction = wallet.payment_transaction(order.id)
+        if transaction is None:
+            raise WalletError("Successful order payment is missing from history")
+    except (PanelError, OrderError, WalletError, sqlite3.Error):
         logger.warning("Paid Stars order requires manual fulfillment review")
         try:
             orders.mark_fulfillment_review(order.id)
         except (OrderError, sqlite3.Error):
             logger.warning("Paid Stars order review state could not be saved")
+        if wallet is not None:
+            try:
+                wallet.complete_order_payment(order.id, status="REVIEW")
+            except WalletError:
+                logger.warning("Stars payment review state could not be saved")
         await message.answer(t("plans.paid_review"))
         return
     if wallet is not None and order.rub_price_minor is not None:
@@ -4606,8 +5549,14 @@ async def process_stars_payment(
             await _notify_referral_reward(bot, reward, topup=False)
         except (WalletError, sqlite3.Error):
             logger.warning("Referral purchase reward could not be recorded")
-    await message.answer(
-        _payment_success_text(plan, order_term, updated), parse_mode="HTML"
+    await answer_screen(
+        message,
+        _payment_success_text(plan, order_term, updated)
+        + _receipt_for_transaction(
+            transaction, operation=t("wallet.receipt_subscription")
+        ),
+        back_keyboard("user:cabinet"),
+        banner="purchase_success",
     )
 
 
@@ -4646,16 +5595,30 @@ async def _process_topup_payment(
         return
     try:
         account = wallet.account(message.from_user.id)
-    except WalletError:
-        account_balance = topup.amount_minor
-    else:
-        account_balance = account.balance_minor
+        bonus_minor = wallet.topup_bonus_minor(topup.id)
+    except (WalletError, sqlite3.Error):
+        logger.warning("Confirmed top-up details could not be loaded")
+        await _notify_payment_admins(bot, settings, topup_id)
+        await message.answer(t("wallet.topup_review"))
+        return
+    account_balance = account.balance_minor
+    transaction = wallet.payment_transaction(topup.id)
+    if transaction is None:
+        logger.warning("Successful top-up is missing from payment history")
+        await _notify_payment_admins(bot, settings, topup.id)
+        await message.answer(t("wallet.topup_review"))
+        return
     await message.answer(
         t(
             "wallet.topup_success",
             amount=format_rubles(topup.amount_minor),
+            bonus=format_rubles(bonus_minor),
             balance=format_rubles(account_balance),
         )
+        + _receipt_for_transaction(
+            transaction, operation=t("wallet.receipt_topup")
+        ),
+        parse_mode="HTML",
     )
     try:
         await _notify_referral_reward(bot, reward, topup=True)
@@ -4722,8 +5685,12 @@ async def process_stars_refund_update(
         ):
             logger.warning("Telegram Stars refund details do not match the order")
             return
-        changed = orders.mark_refunded(order.id)
-    except (OrderError, sqlite3.Error):
+        changed = (
+            wallet.refund_order(order.id)
+            if wallet is not None
+            else orders.mark_refunded(order.id)
+        )
+    except (OrderError, WalletError, sqlite3.Error):
         logger.warning("Telegram Stars refund could not be recorded")
         return
     if changed:
@@ -4779,6 +5746,7 @@ async def refund_stars_payment(
     panel: RemnawaveClient,
     settings: Settings,
     orders: OrderStore,
+    wallet: WalletStore | None = None,
 ) -> None:
     if not _is_admin(message, settings):
         await message.answer(t("admin.command_unavailable"))
@@ -4815,8 +5783,12 @@ async def refund_stars_payment(
         if not refunded:
             await message.answer(t("plans.refund_unavailable"))
             return
-        changed = orders.mark_refunded(order.id)
-    except (TelegramAPIError, OrderError, sqlite3.Error):
+        changed = (
+            wallet.refund_order(order.id)
+            if wallet is not None
+            else orders.mark_refunded(order.id)
+        )
+    except (TelegramAPIError, OrderError, WalletError, sqlite3.Error):
         logger.warning("Stars refund requires manual review")
         await message.answer(t("plans.refund_unavailable"))
         return
@@ -4914,7 +5886,7 @@ async def main() -> None:
         name="ticket-notifications",
     )
     payment_review_task = asyncio.create_task(
-        payment_review_loop(bot, settings, orders),
+        payment_review_loop(bot, settings, orders, wallet),
         name="paid-order-review",
     )
     free_access_task = asyncio.create_task(
@@ -4925,14 +5897,18 @@ async def main() -> None:
         traffic_notification_loop(bot, panel, prefs),
         name="traffic-threshold-notifications",
     )
+    channel_post_task = asyncio.create_task(
+        channel_post_preview_loop(bot, tickets),
+        name="channel-post-previews",
+    )
     try:
         await bot.set_my_commands(
             [
                 BotCommand(command="start", description="Главное меню"),
                 BotCommand(command="connect", description="Подключить VPN"),
                 BotCommand(command="status", description="Проверить доступ"),
-                BotCommand(command="subscription", description="Моя подписка"),
                 BotCommand(command="account", description="Личный кабинет"),
+                BotCommand(command="ping", description="Состояние бота"),
                 BotCommand(command="guides", description="Инструкции"),
                 BotCommand(command="plans", description="Тарифы"),
                 BotCommand(command="devices", description="Мои устройства"),
@@ -4968,6 +5944,7 @@ async def main() -> None:
         payment_review_task.cancel()
         free_access_task.cancel()
         traffic_notification_task.cancel()
+        channel_post_task.cancel()
         trial_nudge_task.cancel()
         for task in (
             reminder_task,
@@ -4978,6 +5955,7 @@ async def main() -> None:
             payment_review_task,
             free_access_task,
             traffic_notification_task,
+            channel_post_task,
         ):
             try:
                 await task

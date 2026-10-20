@@ -19,4 +19,10 @@ services:
         hard: 1048576
     env_file:
       - ${NODE_ENV_FILE:-.env.node}
+    volumes:
+      - hysteria2-certs:/etc/remnawave/hysteria2-certs:ro
     stop_grace_period: 30s
+
+volumes:
+  hysteria2-certs:
+    name: jopesvpn-production-hysteria2-certs

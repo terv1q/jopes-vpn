@@ -46,7 +46,7 @@ The Docker `data` network is marked internal. PostgreSQL has a named data volume
    sudo ufw status numbered
    ```
 
-   The provider firewall should allow the same public ports, except `2222`. During the first Panel admin bootstrap, keep provider TCP `443` restricted to the owner's IP while allowing TCP `80` for ACME HTTP validation; after creating the owner account and closing open registration, allow public TCP `443`. Check provider-specific IPv6 firewall behavior before enabling IPv6.
+   The provider firewall should allow the same public ports, except `2222`. During the first Panel admin bootstrap, keep provider TCP `443` restricted to the owner's IP while allowing TCP `80` for ACME HTTP validation; after creating the owner account and closing open registration, allow public TCP `443`. Check provider-specific IPv6 firewall behavior before enabling IPv6. Hysteria 2 additionally requires public UDP `443`; do not open it until the Hysteria 2 inbound is configured.
 7. Create the private environment file and replace placeholders required for the core Panel/DB/Valkey/proxy services:
 
    ```bash
@@ -141,6 +141,36 @@ Open the HTTPS Subscription Page from the bot and follow its Happ import instruc
 
 The profile uses VLESS + REALITY over `raw`/TCP with no Vision flow. Select REALITY target, server name, key, and short ID using the pinned Panel/Node workflow and verify the generated subscription in Happ. A valid DNS record and successful `xray run -test` do not prove external network access or whitelist bypass.
 
+## Add Hysteria 2 as a third connection
+
+The pinned Node runs Xray `26.7.28`. Remnawave recognizes Hysteria 2 as the `hysteria` inbound protocol with version `2`, and derives each user's Hysteria credential from that user's managed UUID. Happ accepts Hysteria 2 links. This is an additional transport; it does not replace VLESS + REALITY or XHTTP.
+
+The production API token is intentionally read-scoped and cannot edit Config Profiles, Hosts, or Internal Squads. Use the Panel administrator UI to add `hysteria2-inbound.json` to the existing `Germany Exit` Config Profile, activate `JOPES_HYSTERIA2_IN` on `Germany-1`, create a Host for that inbound at `connect.arzhelper.tech:443`, and add the inbound to the existing `JOPES Direct` Internal Squad. Preserve the existing inbounds and settings. The Host must use TLS/SNI `connect.arzhelper.tech`. This grants Hysteria 2 to every user already in that squad.
+
+The Node reads a dedicated copy of Caddy's certificate, not Caddy's private-data volume. Copy the deployment files to `/opt/jopesvpn/deploy/production`, then run as the Docker-capable account:
+
+```bash
+cd /opt/jopesvpn/deploy/production
+docker compose --env-file .env -f docker-compose.yml -f docker-compose.node.yml --profile node up -d --no-deps remnawave-node
+docker volume create jopesvpn-production-hysteria2-certs >/dev/null
+sudo install -m 0755 sync-hysteria2-cert.sh /usr/local/sbin/jopesvpn-sync-hysteria2-cert
+sudo install -m 0644 jopesvpn-hysteria2-cert-sync.service /etc/systemd/system/
+sudo install -m 0644 jopesvpn-hysteria2-cert-sync.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now jopesvpn-hysteria2-cert-sync.timer
+sudo systemctl start jopesvpn-hysteria2-cert-sync.service
+sudo systemctl --no-pager --full status jopesvpn-hysteria2-cert-sync.service
+```
+
+The initial certificate sync restarts the Node once; later syncs restart it only when Caddy renews the certificate. Opening a firewall port requires root, and provider firewalls are separate:
+
+```bash
+sudo ufw allow 443/udp comment 'JopesVPN Hysteria 2'
+sudo ufw status numbered
+```
+
+Also allow UDP `443` in the VPS provider firewall. Verify `docker inspect jopesvpn-production-node`, Panel Node connectivity, UDP `443`, and the user's own subscription in Happ before announcing availability. If the Panel editor or generated subscription on version `3.4.5` rejects this inbound, leave it disabled; do not create a shared static password as a workaround.
+
 ## Health checks and troubleshooting
 
 Never inspect environment values or dump full Panel subscriptions/configs into logs. Use:
@@ -171,6 +201,7 @@ docker compose --env-file .env -f docker-compose.yml --profile bot logs --tail=1
 - **Tariff checkout rollout (production, 2026-10-18):** before the additive `orders` migration, the shared `/app/data` directory was copied while both SQLite writers were stopped; backup `tariff-predeploy-20261018T144531Z` passed `PRAGMA integrity_check`. Rollback images were saved for bot and ticket portal. Only bot was rebuilt; bot and ticket-forum were restarted. Panel, Node, Caddy, PostgreSQL, Valkey and VPN configuration were not changed. Telegram `getMe` (39 handlers), 8 active tariffs/unique TAGs, order schema, SQLite integrity, Panel health, `2053/TCP` and container states were checked; both app services run with restart count 0. An invalid-ID update probe reached Panel validation without modifying a user. No Stars transaction, subscription mutation, or quota-exhaustion tunnel test was performed.
 - **Ticket portal rollout (2026-10-18):** before rollout the existing bot image was tagged for rollback and the complete SQLite data directory was copied while the bot was stopped; `PRAGMA integrity_check` returned `ok`. New bot and portal images were built locally on the VPS, then only `bot`, `ticket-forum`, and Caddy were updated. The Caddy container was recreated to attach its new private network; this briefly interrupted HTTPS/Panel web access, but Panel, Node, database, Subscription Page, and the VPN inbound were not restarted or changed. Public `/support/` and `/support/admin` returned HTTP 200, the connect host root retained its HTTP 302 behavior, Telegram `getMe` succeeded, and the portal has no published host port. An automated admin login/session smoke-check passed without displaying the generated password; no real ticket or user reply was created.
 - **Current bot and ticket portal rollout (2026-10-18):** rollback images for both services and a protected copy of the shared SQLite data were saved before rollout; backup integrity passed. Only bot and ticket-forum were rebuilt/recreated. Panel, Node, Caddy, PostgreSQL, DNS and the VPN inbound were not restarted. Telegram `getMe`, required commands, Panel `nodes:list`, SQLite integrity/migrations, admin login/session, unauthenticated admin denial and user-ticket 404 were verified. No real Stars payment or ticket was created; `2053/TCP` remained listening.
+- **Channel post editor rollout (2026-10-19):** backed up the shared SQLite directory and retained rollback images `jopesvpn-bot:rollback-20261019T192817Z` and `jopesvpn-ticket-portal:rollback-20261019T192817Z`; backup integrity passed. Only bot and ticket-forum were rebuilt/recreated. The additive `channel_posts` and `channel_post_clicks` tables were created. Telegram `getMe` and 53 registered handlers passed; bot and portal run with restart count 0, SQLite integrity is `ok`, and unauthenticated `/support/admin/posts` returns 401. No channel post was published during verification.
 - **Previous admin cards, Panel-data resilience, trial resources, and callback hotfix (2026-10-18):** before each bot/ticket-forum stop, rollback images and protected SQLite copies were retained; both backup integrity checks passed. Only the bot image was rebuilt; bot and ticket-forum restarted. Telegram `getMe` reported 33 handlers; polling process and both services are running with restart count 0. Panel health returned HTTP 200, SQLite integrity returned `ok`, and `2053/TCP` remained listening. At that point traffic plans were not yet deployed; see the newer tariff rollout above.
 - **Bot-only update after UX/referral changes (historical):** the 2026-10-17 rollout used the earlier procedure. For future bot+portal releases, back up SQLite state and restart only bot and ticket-forum, so polling and portal access pause briefly; VPN, Panel, Node, Caddy and their ports are not intentionally changed. Run as the Docker-capable SSH account; store the private backup under that account's home directory, not a web-served path. Preserve both old images before stopping both writers, then copy the complete data directory from the stopped bot container:
 
@@ -197,7 +228,7 @@ docker compose --env-file .env -f docker-compose.yml --profile bot logs --tail=1
   docker exec jopesvpn-production-bot python -m jopesvpn.bot --check-telegram
   ```
 
-  SQLite migrations are additive: they add navigation/order metadata and support ticket tables/columns without deleting Panel accounts or VPN data. Do not restore the old SQLite file after users/payments/tickets may have changed; rollback the application image while preserving the migrated database. If rollback is needed in the same shell, retag both saved pre-update images:
+  SQLite migrations are additive: they add navigation/order metadata, support ticket tables/columns, and the wallet payment/bonus audit tables without deleting Panel accounts or VPN data. Bot startup backfills confirmed Stars top-ups, paid subscription orders, and settled withdrawals into the payment history. Admins use **Balances and bonuses** to make reason-required balance adjustments, configure a fixed-ruble or percentage bonus for future confirmed top-ups, and search payment records by ID. Only Telegram Stars is configured as an external payment method; do not advertise or credit other methods until a real provider and verified callback are implemented. Do not restore the old SQLite file after users/payments/tickets may have changed; rollback the application image while preserving the migrated database. If rollback is needed in the same shell, retag both saved pre-update images:
 
   ```bash
   docker compose --env-file .env -f docker-compose.yml --profile bot stop bot ticket-forum

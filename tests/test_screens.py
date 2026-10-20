@@ -117,7 +117,7 @@ class CabinetKeyboardTests(unittest.TestCase):
         button = active.inline_keyboard[0][0]
         self.assertEqual(button.url, "https://connect.example.test/user")
         self.assertIsNone(button.callback_data)
-        self.assertEqual(active.inline_keyboard[1][0].callback_data, "user:subscription")
+        self.assertEqual(active.inline_keyboard[1][0].callback_data, "user:cabinet")
         self.assertEqual(len(active.inline_keyboard), 4)
 
         expired = home_keyboard(False, trial_available=False)
@@ -139,6 +139,42 @@ class CabinetKeyboardTests(unittest.TestCase):
         self.assertIn("user:settings", callbacks)
         self.assertIn("user:stats", callbacks)
         self.assertIn("user:devices", callbacks)
+        self.assertNotIn("user:subscription", callbacks)
+
+    def test_cabinet_uses_png_purchase_artwork(self) -> None:
+        from jopesvpn.ui import cabinet_keyboard, topup_methods_keyboard
+
+        self.assertEqual(banner_path("purchase_success").suffix, ".png")
+        callbacks = {
+            button.callback_data
+            for row in cabinet_keyboard().inline_keyboard
+            for button in row
+        }
+        self.assertNotIn("user:subscription", callbacks)
+        self.assertIn("user:topup", callbacks)
+        payment_methods = topup_methods_keyboard(470).inline_keyboard
+        self.assertEqual(payment_methods[0][0].callback_data, "topup:pay:stars")
+        self.assertIn("470", payment_methods[0][0].text)
+
+    def test_payment_history_displays_operation_id_and_method(self) -> None:
+        from jopesvpn.ui import wallet_text
+        from jopesvpn.wallet import PaymentTransaction
+
+        transaction = PaymentTransaction(
+            "payment-123",
+            1001,
+            470,
+            "XTR",
+            50_000,
+            "telegram_stars",
+            "topup",
+            "SUCCESS",
+            "2026-10-20T12:00:00+00:00",
+        )
+        text = wallet_text([transaction], None)
+        self.assertIn("payment-123", text)
+        self.assertIn("Telegram Stars", text)
+        self.assertIn("500 ₽", text)
 
     def test_stars_catalog_hides_unsupported_traffic_plans(self) -> None:
         from jopesvpn.plans import Plan
@@ -368,6 +404,16 @@ class CabinetKeyboardTests(unittest.TestCase):
         self.assertNotIn("Тариф — через поддержку", connection)
         self.assertNotIn("Пробный период — 3 дня", connection)
 
+    def test_cabinet_shows_ruble_wallet_balance(self) -> None:
+        from jopesvpn.ui import cabinet_text
+
+        cabinet = cabinet_text(
+            None,
+            telegram_id=123,
+            balance_minor=12_345,
+        )
+        self.assertIn("Рублёвый баланс: 123,45 ₽", cabinet)
+
     def test_admin_user_card_has_direct_chat_button(self) -> None:
         from jopesvpn.ui import admin_user_keyboard
 
@@ -393,11 +439,11 @@ class BannerMappingTests(unittest.TestCase):
     def test_user_screens_map_to_banners(self) -> None:
         expected = {
             "user:home": "home",
-            "user:cabinet": "cabinet",
-            "user:profile": "cabinet",
+            "user:cabinet": "purchase_success",
+            "user:profile": "purchase_success",
             "user:connect": "connect",
-            "user:subscription": "subscription",
-            "user:key": "subscription",
+            "user:subscription": "purchase_success",
+            "user:key": "purchase_success",
             "user:devices": "devices",
             "user:referrals": "stats",
             "dev:del:0": "devices",

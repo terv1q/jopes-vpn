@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
+import uuid
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from html import escape
+from typing import cast
 from urllib.parse import urlsplit
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.filters import Command, StateFilter
 from aiogram.types import CallbackQuery, Message
 
 from jopesvpn.config import Settings
@@ -25,6 +28,7 @@ from jopesvpn.panel import (
     PanelUser,
     RemnawaveClient,
 )
+from jopesvpn.plans import format_rubles
 from jopesvpn.preferences import PreferencesError, PreferencesStore
 from jopesvpn.screens import answer_screen, edit_screen
 from jopesvpn.timezones import (
@@ -35,9 +39,9 @@ from jopesvpn.timezones import (
 from jopesvpn.ui import (
     ADMIN_USERS_PER_PAGE,
     DEVICES_PER_PAGE,
-    admin_documents_keyboard,
     admin_devices_keyboard,
     admin_devices_text,
+    admin_documents_keyboard,
     admin_keyboard,
     admin_logs_keyboard,
     admin_logs_text,
@@ -53,8 +57,10 @@ from jopesvpn.ui import (
     format_bytes,
     status_text,
     tariff_text,
+    wallet_admin_confirm_keyboard,
+    wallet_admin_keyboard,
 )
-
+from jopesvpn.wallet import MAX_TOPUP_MINOR, WalletError, WalletStore
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin")
@@ -81,6 +87,14 @@ class DocumentsFlow(StatesGroup):
     url = State()
 
 
+class WalletAdminFlow(StatesGroup):
+    adjust_input = State()
+    adjust_confirm = State()
+    bonus_input = State()
+    bonus_confirm = State()
+    payment_lookup = State()
+
+
 def _private_admin(message: Message, settings: Settings) -> bool:
     return (
         message.chat.type == "private"
@@ -95,6 +109,236 @@ def _admin_callback(callback: CallbackQuery, settings: Settings) -> bool:
         and callback.message.chat.type == "private"
         and callback.from_user.id in settings.admin_telegram_ids
     )
+
+
+def _parse_admin_rubles(raw: str) -> int | None:
+    try:
+        amount = Decimal(raw.strip().replace(",", "."))
+    except InvalidOperation:
+        return None
+    if not amount.is_finite() or amount * 100 != (amount * 100).to_integral_value():
+        return None
+    return int(amount * 100)
+
+
+@router.message(WalletAdminFlow.adjust_input)
+async def receive_wallet_adjustment(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if not _private_admin(message, settings):
+        await state.clear()
+        await message.answer(t("admin.command_unavailable"))
+        return
+    if (message.text or "").strip().casefold() in {"/cancel", "отмена"}:
+        await state.clear()
+        await message.answer(t("admin.wallet_cancelled"), reply_markup=admin_keyboard())
+        return
+    parts = (message.text or "").strip().split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(t("admin.wallet_adjust_prompt"))
+        return
+    try:
+        telegram_id = int(parts[0])
+    except ValueError:
+        await message.answer(t("admin.wallet_adjust_invalid"))
+        return
+    amount_minor = _parse_admin_rubles(parts[1])
+    reason = parts[2].strip()
+    if telegram_id <= 0 or amount_minor in (None, 0) or not reason:
+        await message.answer(t("admin.wallet_adjust_invalid"))
+        return
+    if abs(amount_minor) > MAX_TOPUP_MINOR or len(reason) > 300:
+        await message.answer(t("admin.wallet_adjust_invalid"))
+        return
+    assert message.from_user is not None
+    operation_id = uuid.uuid4().hex
+    await state.update_data(
+        admin_id=message.from_user.id,
+        adjustment_user_id=telegram_id,
+        adjustment_amount_minor=amount_minor,
+        adjustment_reason=reason,
+        operation_id=operation_id,
+    )
+    await state.set_state(WalletAdminFlow.adjust_confirm)
+    await message.answer(
+        t(
+            "admin.wallet_adjust_preview",
+            telegram_id=telegram_id,
+            amount=format_rubles(abs(amount_minor)),
+            direction="зачислить" if amount_minor > 0 else "списать",
+            reason=escape(reason),
+        ),
+        reply_markup=wallet_admin_confirm_keyboard("adjust"),
+        parse_mode="HTML",
+    )
+
+
+@router.message(WalletAdminFlow.bonus_input)
+async def receive_wallet_bonus(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if not _private_admin(message, settings):
+        await state.clear()
+        await message.answer(t("admin.command_unavailable"))
+        return
+    if (message.text or "").strip().casefold() in {"/cancel", "отмена"}:
+        await state.clear()
+        await message.answer(t("admin.wallet_cancelled"), reply_markup=admin_keyboard())
+        return
+    parts = (message.text or "").strip().split()
+    if len(parts) != 2 or parts[0].casefold() not in {"fixed", "percent"}:
+        await message.answer(t("admin.wallet_bonus_prompt"))
+        return
+    mode = parts[0].casefold()
+    if mode == "fixed":
+        value = _parse_admin_rubles(parts[1])
+        if value is None:
+            await message.answer(t("admin.wallet_bonus_invalid"))
+            return
+        description = format_rubles(value)
+    else:
+        try:
+            value = int(parts[1])
+        except ValueError:
+            await message.answer(t("admin.wallet_bonus_invalid"))
+            return
+        description = f"{value}%"
+    if value <= 0 or (mode == "percent" and value > 100):
+        await message.answer(t("admin.wallet_bonus_invalid"))
+        return
+    assert message.from_user is not None
+    await state.update_data(
+        admin_id=message.from_user.id,
+        bonus_mode=mode,
+        bonus_value=value,
+        bonus_description=description,
+    )
+    await state.set_state(WalletAdminFlow.bonus_confirm)
+    await message.answer(
+        t("admin.wallet_bonus_preview", value=description),
+        reply_markup=wallet_admin_confirm_keyboard("bonus"),
+    )
+
+
+@router.message(WalletAdminFlow.payment_lookup)
+async def receive_wallet_payment_lookup(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+    wallet: WalletStore | None = None,
+) -> None:
+    if not _private_admin(message, settings):
+        await state.clear()
+        await message.answer(t("admin.command_unavailable"))
+        return
+    payment_id = (message.text or "").strip()
+    if payment_id.casefold() in {"/cancel", "отмена"}:
+        await state.clear()
+        await message.answer(t("admin.wallet_cancelled"), reply_markup=admin_keyboard())
+        return
+    if wallet is None or not payment_id:
+        await message.answer(t("wallet.unavailable"))
+        return
+    try:
+        payment = wallet.payment_transaction(payment_id)
+    except WalletError:
+        logger.warning("Admin payment lookup failed")
+        await message.answer(t("admin.wallet_operation_failed"))
+        return
+    if payment is None:
+        await message.answer(t("admin.wallet_payment_not_found"))
+        return
+    amount = (
+        f"{payment.amount_paid_minor} ⭐ "
+        f"({format_rubles(payment.rub_amount_minor)})"
+        if payment.currency == "XTR"
+        else format_rubles(payment.rub_amount_minor)
+    )
+    await message.answer(
+        t(
+            "admin.wallet_payment_found",
+            operation_id=escape(payment.id),
+            telegram_id=payment.telegram_id,
+            amount=amount,
+            method=escape(payment.method),
+            purpose=escape(payment.purpose),
+            status=escape(payment.status),
+            created_at=escape(payment.created_at),
+        ),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(
+    F.data.in_(
+        {
+            "admin:wallet:confirm-adjust",
+            "admin:wallet:confirm-bonus",
+            "admin:wallet:cancel",
+        }
+    )
+)
+async def confirm_wallet_admin_action(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+    wallet: WalletStore | None = None,
+) -> None:
+    if not _admin_callback(callback, settings):
+        await callback.answer(t("admin.command_unavailable"), show_alert=True)
+        return
+    if callback.data == "admin:wallet:cancel":
+        await state.clear()
+        await callback.answer()
+        await _edit(callback, t("admin.wallet_cancelled"), admin_keyboard())
+        return
+    if wallet is None:
+        await callback.answer(t("wallet.unavailable"), show_alert=True)
+        return
+    data = await state.get_data()
+    if data.get("admin_id") != callback.from_user.id:
+        await state.clear()
+        await callback.answer(t("admin.wallet_invalid"), show_alert=True)
+        return
+    try:
+        if callback.data == "admin:wallet:confirm-adjust":
+            if await state.get_state() != WalletAdminFlow.adjust_confirm.state:
+                await callback.answer(t("admin.wallet_invalid"), show_alert=True)
+                return
+            applied = wallet.adjust_balance(
+                operation_id=data["operation_id"],
+                admin_telegram_id=callback.from_user.id,
+                telegram_id=data["adjustment_user_id"],
+                amount_minor=data["adjustment_amount_minor"],
+                reason=data["adjustment_reason"],
+            )
+            result = t(
+                "admin.wallet_adjust_done",
+                telegram_id=data["adjustment_user_id"],
+                amount=format_rubles(abs(data["adjustment_amount_minor"])),
+                operation_id=data["operation_id"],
+            ) if applied else t("admin.wallet_already_applied")
+        else:
+            if await state.get_state() != WalletAdminFlow.bonus_confirm.state:
+                await callback.answer(t("admin.wallet_invalid"), show_alert=True)
+                return
+            wallet.configure_bonus(
+                callback.from_user.id, data["bonus_mode"], data["bonus_value"]
+            )
+            result = t(
+                "admin.wallet_bonus_done", value=data["bonus_description"]
+            )
+    except (WalletError, ValueError, KeyError, TypeError):
+        logger.warning("Admin wallet operation could not be applied")
+        await callback.answer(t("admin.wallet_operation_failed"), show_alert=True)
+        return
+    await state.clear()
+    await callback.answer()
+    await _edit(callback, result, admin_keyboard())
 
 
 @router.message(BroadcastFlow.message)
@@ -338,7 +582,9 @@ async def _edit(
 ) -> None:
     if callback.message is None:
         return
-    await edit_screen(callback.message, text, markup, data=callback.data)
+    await edit_screen(
+        cast(Message, callback.message), text, markup, data=callback.data
+    )
 
 
 def _result_text(title: str, rows: list[str]) -> str:
@@ -1396,6 +1642,33 @@ async def admin_navigation(
         await state.clear()
         await callback.answer()
         await _edit(callback, _menu_text(), admin_keyboard())
+    elif action == "wallet":
+        await state.clear()
+        await callback.answer()
+        await _edit(callback, t("admin.wallet_title"), wallet_admin_keyboard())
+    elif action == "wallet:adjust":
+        await state.clear()
+        await state.set_state(WalletAdminFlow.adjust_input)
+        await callback.answer()
+        await _edit(
+            callback, t("admin.wallet_adjust_prompt"), back_keyboard("admin:home")
+        )
+    elif action == "wallet:bonus":
+        await state.clear()
+        await state.set_state(WalletAdminFlow.bonus_input)
+        await callback.answer()
+        await _edit(
+            callback, t("admin.wallet_bonus_prompt"), back_keyboard("admin:wallet")
+        )
+    elif action == "wallet:find":
+        await state.clear()
+        await state.set_state(WalletAdminFlow.payment_lookup)
+        await callback.answer()
+        await _edit(
+            callback,
+            t("admin.wallet_payment_lookup_prompt"),
+            back_keyboard("admin:wallet"),
+        )
     elif action == "docs":
         await state.clear()
         if prefs is None:

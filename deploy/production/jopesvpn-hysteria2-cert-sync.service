@@ -1,0 +1,8 @@
+[Unit]
+Description=Sync the Caddy TLS certificate for the Hysteria 2 inbound
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/jopesvpn-sync-hysteria2-cert

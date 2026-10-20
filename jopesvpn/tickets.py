@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import secrets
 import sqlite3
 from contextlib import closing
@@ -72,6 +73,35 @@ class TicketStore:
                     );
                     CREATE INDEX IF NOT EXISTS support_ticket_notifications_pending
                         ON support_ticket_notifications(delivered_at, attempted_at);
+                    CREATE TABLE IF NOT EXISTS channel_posts (
+                        post_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        owner_id INTEGER NOT NULL,
+                        body_html TEXT NOT NULL,
+                        buttons_json TEXT NOT NULL,
+                        photo_data BLOB,
+                        photo_mime TEXT,
+                        status TEXT NOT NULL DEFAULT 'queued'
+                            CHECK(status IN (
+                                'queued', 'preview_sending', 'awaiting_approval',
+                                'publishing', 'published', 'cancelled'
+                            )),
+                        preview_message_id INTEGER,
+                        channel_message_id INTEGER,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    );
+                    CREATE INDEX IF NOT EXISTS channel_posts_status_created
+                        ON channel_posts(status, created_at);
+                    CREATE TABLE IF NOT EXISTS channel_post_clicks (
+                        click_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        post_id INTEGER NOT NULL REFERENCES channel_posts(post_id),
+                        button_index INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        user_name TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    );
+                    CREATE INDEX IF NOT EXISTS channel_post_clicks_post
+                        ON channel_post_clicks(post_id, created_at);
                     """
                 )
                 columns = {
@@ -142,7 +172,9 @@ class TicketStore:
                     """,
                     (user_id, user_name[:120], category),
                 )
-                ticket_id = int(cursor.lastrowid)
+                if cursor.lastrowid is None:
+                    raise sqlite3.DatabaseError("Ticket ID was not generated")
+                ticket_id = cursor.lastrowid
                 connection.execute(
                     """
                     INSERT INTO support_ticket_messages
@@ -653,3 +685,245 @@ class TicketStore:
             ),
             "rated": int(row["rated_count"] or 0),
         }
+
+    def create_channel_post(
+        self,
+        owner_id: int,
+        body_html: str,
+        buttons: list[list[dict[str, str]]],
+        photo_data: bytes | None,
+        photo_mime: str | None,
+    ) -> int:
+        if owner_id <= 0 or (not body_html and photo_data is None):
+            raise ValueError("Invalid channel post")
+        if len(body_html) > 1024 or (photo_data is not None and len(photo_data) > 10_000_000):
+            raise ValueError("Channel post is too large")
+        try:
+            buttons_json = json.dumps(buttons, ensure_ascii=True, separators=(",", ":"))
+            with closing(self._connect()) as connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO channel_posts
+                        (owner_id, body_html, buttons_json, photo_data, photo_mime)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (owner_id, body_html, buttons_json, photo_data, photo_mime),
+                )
+                connection.commit()
+                if cursor.lastrowid is None:
+                    raise sqlite3.DatabaseError("Channel post ID was not generated")
+                return cursor.lastrowid
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot save channel post") from error
+
+    def channel_posts(self, limit: int = 30) -> list[dict[str, Any]]:
+        if limit < 1:
+            raise ValueError("Limit must be positive")
+        try:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT post_id, body_html, status, created_at, updated_at,
+                           photo_data IS NOT NULL AS has_photo
+                    FROM channel_posts ORDER BY post_id DESC LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot read channel posts") from error
+        return [dict(row) for row in rows]
+
+    def pending_channel_posts(self, limit: int = 5) -> list[dict[str, Any]]:
+        try:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM channel_posts WHERE status = 'queued'
+                    ORDER BY post_id LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot read pending channel posts") from error
+        return [dict(row) for row in rows]
+
+    def recover_channel_post_previews(self) -> int:
+        try:
+            with closing(self._connect()) as connection:
+                changed = connection.execute(
+                    """
+                    UPDATE channel_posts
+                    SET status = 'queued', updated_at = datetime('now')
+                    WHERE status = 'preview_sending'
+                      AND updated_at <= datetime('now', '-5 minutes')
+                    """
+                ).rowcount
+                connection.commit()
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot recover channel post previews") from error
+        return changed
+
+    def claim_channel_post_preview(self, post_id: int) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                changed = connection.execute(
+                    """
+                    UPDATE channel_posts
+                    SET status = 'preview_sending', updated_at = datetime('now')
+                    WHERE post_id = ? AND status = 'queued'
+                    """,
+                    (post_id,),
+                ).rowcount
+                connection.commit()
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot claim channel post preview") from error
+        return changed == 1
+
+    def finish_channel_post_preview(self, post_id: int, message_id: int) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                changed = connection.execute(
+                    """
+                    UPDATE channel_posts
+                    SET status = 'awaiting_approval', preview_message_id = ?,
+                        updated_at = datetime('now')
+                    WHERE post_id = ? AND status = 'preview_sending'
+                    """,
+                    (message_id, post_id),
+                ).rowcount
+                connection.commit()
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot save channel post preview") from error
+        return changed == 1
+
+    def retry_channel_post_preview(self, post_id: int) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                changed = connection.execute(
+                    """
+                    UPDATE channel_posts
+                    SET status = 'queued', updated_at = datetime('now')
+                    WHERE post_id = ? AND status = 'preview_sending'
+                    """,
+                    (post_id,),
+                ).rowcount
+                connection.commit()
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot retry channel post preview") from error
+        return changed == 1
+
+    def get_channel_post(self, post_id: int) -> dict[str, Any] | None:
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT * FROM channel_posts WHERE post_id = ?", (post_id,)
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot read channel post") from error
+        return None if row is None else dict(row)
+
+    def claim_channel_post_publication(self, post_id: int, owner_id: int) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                changed = connection.execute(
+                    """
+                    UPDATE channel_posts
+                    SET status = 'publishing', updated_at = datetime('now')
+                    WHERE post_id = ? AND owner_id = ?
+                      AND status = 'awaiting_approval'
+                    """,
+                    (post_id, owner_id),
+                ).rowcount
+                connection.commit()
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot claim channel post publication") from error
+        return changed == 1
+
+    def finish_channel_post_publication(
+        self, post_id: int, message_id: int
+    ) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                changed = connection.execute(
+                    """
+                    UPDATE channel_posts
+                    SET status = 'published', channel_message_id = ?,
+                        updated_at = datetime('now')
+                    WHERE post_id = ? AND status = 'publishing'
+                    """,
+                    (message_id, post_id),
+                ).rowcount
+                connection.commit()
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot finish channel post publication") from error
+        return changed == 1
+
+    def retry_channel_post_publication(self, post_id: int) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                changed = connection.execute(
+                    """
+                    UPDATE channel_posts
+                    SET status = 'awaiting_approval', updated_at = datetime('now')
+                    WHERE post_id = ? AND status = 'publishing'
+                    """,
+                    (post_id,),
+                ).rowcount
+                connection.commit()
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot retry channel post publication") from error
+        return changed == 1
+
+    def cancel_channel_post(self, post_id: int, owner_id: int) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                changed = connection.execute(
+                    """
+                    UPDATE channel_posts
+                    SET status = 'cancelled', updated_at = datetime('now')
+                    WHERE post_id = ? AND owner_id = ?
+                      AND status = 'awaiting_approval'
+                    """,
+                    (post_id, owner_id),
+                ).rowcount
+                connection.commit()
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot cancel channel post") from error
+        return changed == 1
+
+    def record_channel_post_click(
+        self, post_id: int, button_index: int, user_id: int, user_name: str
+    ) -> dict[str, Any] | None:
+        if post_id <= 0 or button_index < 0 or user_id <= 0:
+            raise ValueError("Invalid channel post click")
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT buttons_json FROM channel_posts
+                    WHERE post_id = ? AND status = 'published'
+                    """,
+                    (post_id,),
+                ).fetchone()
+                if row is None:
+                    connection.rollback()
+                    return None
+                buttons = json.loads(row["buttons_json"])
+                flat_buttons = [button for row in buttons for button in row]
+                if button_index >= len(flat_buttons):
+                    connection.rollback()
+                    return None
+                button = flat_buttons[button_index]
+                connection.execute(
+                    """
+                    INSERT INTO channel_post_clicks
+                        (post_id, button_index, user_id, user_name)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (post_id, button_index, user_id, user_name[:120]),
+                )
+                connection.commit()
+                return dict(button)
+        except (sqlite3.Error, ValueError, TypeError) as error:
+            raise TicketStoreError("Cannot record channel post click") from error

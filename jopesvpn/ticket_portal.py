@@ -10,26 +10,106 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from email import policy
+from email.parser import BytesParser
+from html.parser import HTMLParser
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
-from urllib.parse import parse_qs
-from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from jopesvpn.tickets import TicketStore, TicketStoreError
 
 logger = logging.getLogger(__name__)
 BASE_PATH = "/support"
-MAX_REQUEST_BYTES = 12_000
+MAX_REQUEST_BYTES = 12_000_000
+MAX_FORM_BYTES = 12_000
 MESSAGE_PAGE_SIZE = 50
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
 ADMIN_TICKET_PATTERN = re.compile(r"^/support/admin/ticket/([1-9][0-9]*)$")
+ADMIN_POSTS_PATH = BASE_PATH + "/admin/posts"
 UTC_PLUS_FIVE = timezone(timedelta(hours=5))
+TELEGRAM_TAGS = {
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+    "code", "pre", "a", "blockquote",
+}
+
+
+class _TelegramHtmlSanitizer(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.stack: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag == "br":
+            self.parts.append("<br>")
+            return
+        if tag in {"div", "p"}:
+            if self.parts and not self.parts[-1].endswith("<br>"):
+                self.parts.append("<br>")
+            return
+        if tag not in TELEGRAM_TAGS:
+            return
+        if tag == "a":
+            href = dict(attrs).get("href", "")
+            parsed = urlsplit(href)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username
+                or any(character.isspace() for character in href)
+            ):
+                return
+            try:
+                port = parsed.port
+            except ValueError:
+                return
+            if port == 0:
+                return
+            self.parts.append(f'<a href="{html.escape(href, quote=True)}">')
+        else:
+            self.parts.append(f"<{tag}>")
+        self.stack.append(tag)
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        if tag == "br":
+            self.parts.append("<br>")
+        else:
+            self.handle_starttag(tag, attrs)
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag not in self.stack:
+            return
+        while self.stack:
+            opened = self.stack.pop()
+            self.parts.append(f"</{opened}>")
+            if opened == tag:
+                break
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(html.escape(data, quote=False))
+
+    def finish(self) -> str:
+        while self.stack:
+            self.parts.append(f"</{self.stack.pop()}>")
+        return "".join(self.parts).strip()
+
+
+def _sanitize_post_html(value: str) -> str:
+    sanitizer = _TelegramHtmlSanitizer()
+    sanitizer.feed(value)
+    sanitizer.close()
+    return sanitizer.finish()
 
 
 class RedactingRequestHandler(WSGIRequestHandler):
     def log_message(self, format_string: str, *args: Any) -> None:
-        self.server.logger.info("Ticket portal request completed")
+        getattr(self.server, "logger", logger).info(
+            "Ticket portal request completed"
+        )
 
 
 def _escape(value: Any) -> str:
@@ -79,8 +159,11 @@ a{{color:#9bc8ff}}.toolbar{{display:flex;gap:10px;align-items:center;flex-wrap:w
         ("Referrer-Policy", "no-referrer"),
         (
             "Content-Security-Policy",
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
-            "base-uri 'none'; frame-ancestors 'none'",
+            (
+                "default-src 'none'; style-src 'unsafe-inline'; "
+                "script-src 'unsafe-inline'; form-action 'self'; "
+                "base-uri 'none'; frame-ancestors 'none'"
+            ),
         ),
         *headers,
     ]
@@ -136,6 +219,13 @@ class TicketPortalApp:
                     )
                 page = self._parse_page(query)
                 return self._admin_list(start_response, page)
+            if path == ADMIN_POSTS_PATH:
+                if not self._is_admin(environ):
+                    return self._response(
+                        start_response,
+                        *_page("Требуется вход", self._login_form(), status=401),
+                    )
+                return self._admin_posts(environ, start_response, method)
             if path == BASE_PATH + "/admin/logout" and method == "POST":
                 return self._redirect(
                     start_response,
@@ -206,7 +296,7 @@ class TicketPortalApp:
             length = int(environ.get("CONTENT_LENGTH") or "0")
         except ValueError:
             raise ValueError("Invalid request length") from None
-        if length < 0 or length > MAX_REQUEST_BYTES:
+        if length < 0 or length > MAX_FORM_BYTES:
             raise ValueError("Request is too large")
         content_type = environ.get("CONTENT_TYPE", "")
         if content_type.split(";", 1)[0].strip().lower() != (
@@ -215,6 +305,45 @@ class TicketPortalApp:
             raise ValueError("Unsupported form encoding")
         data = environ["wsgi.input"].read(length).decode("utf-8")
         return parse_qs(data, keep_blank_values=True, max_num_fields=8)
+
+    def _read_post_fields(self, environ):
+        try:
+            length = int(environ.get("CONTENT_LENGTH") or "0")
+        except ValueError:
+            raise ValueError("Invalid request length") from None
+        if length < 0 or length > MAX_REQUEST_BYTES:
+            raise ValueError("Request is too large")
+        content_type = environ.get("CONTENT_TYPE", "")
+        if content_type.split(";", 1)[0].strip().lower() == (
+            "application/x-www-form-urlencoded"
+        ):
+            data = environ["wsgi.input"].read(length).decode("utf-8")
+            return parse_qs(data, keep_blank_values=True, max_num_fields=32), None
+        if content_type.split(";", 1)[0].strip().lower() != "multipart/form-data":
+            raise ValueError("Unsupported form encoding")
+        headers = (
+            f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n"
+        ).encode("ascii", errors="strict")
+        message = BytesParser(policy=policy.default).parsebytes(
+            headers + environ["wsgi.input"].read(length)
+        )
+        fields: dict[str, list[str]] = {}
+        photo: tuple[bytes, str] | None = None
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if not name or name not in {"action", "body_html", "photo"} and not re.fullmatch(
+                r"button_(label|url|row)_[0-7]", name
+            ):
+                continue
+            payload = part.get_payload(decode=True) or b""
+            filename = part.get_filename()
+            if filename:
+                if name != "photo" or photo is not None:
+                    raise ValueError("Unexpected upload")
+                photo = (payload, part.get_content_type().lower())
+            else:
+                fields.setdefault(name, []).append(payload.decode("utf-8"))
+        return fields, photo
 
     def _login_form(self, error: str = "") -> str:
         error_html = f'<p class="closed">{_escape(error)}</p>' if error else ""
@@ -350,6 +479,7 @@ class TicketPortalApp:
                 "Следующие</a>"
             )
         paging += (
+            f'<a class="button secondary" href="{ADMIN_POSTS_PATH}">Создать пост</a>'
             f'<form method="post" action="{BASE_PATH}/admin/logout">'
             '<button class="secondary" type="submit">Выйти</button></form></div>'
         )
@@ -362,6 +492,169 @@ class TicketPortalApp:
                 + paging,
             ),
         )
+
+    @staticmethod
+    def _same_origin(environ) -> bool:
+        origin = urlsplit(environ.get("HTTP_ORIGIN", ""))
+        host = environ.get("HTTP_HOST", "").lower()
+        return bool(host and origin.netloc.lower() == host and origin.scheme in {"http", "https"})
+
+    def _admin_posts(self, environ, start_response, method: str):
+        if method == "POST":
+            if not self._same_origin(environ):
+                return self._response(
+                    start_response,
+                    *_page("Запрос отклонён", "<p>Обновите страницу и попробуйте ещё раз.</p>", status=403),
+                )
+            fields, photo = self._read_post_fields(environ)
+            if fields.get("action", [""])[0] != "create_post":
+                return self._response(
+                    start_response,
+                    *_page("Некорректный запрос", "<p>Неизвестное действие.</p>", status=400),
+                )
+            body_html = _sanitize_post_html(fields.get("body_html", [""])[0])
+            if len(body_html) > 1024:
+                return self._response(
+                    start_response,
+                    *_page("Текст слишком длинный", "<p>Для поста Telegram доступно не более 1024 символов.</p>", status=400),
+                )
+            buttons: dict[int, list[dict[str, str]]] = {}
+            for index in range(8):
+                label = fields.get(f"button_label_{index}", [""])[0].strip()
+                target = fields.get(f"button_url_{index}", [""])[0].strip()
+                row_text = fields.get(f"button_row_{index}", ["1"])[0].strip()
+                if not label and not target:
+                    continue
+                if not label or not target or len(label) > 64:
+                    raise ValueError("Button label and URL are required")
+                parsed = urlsplit(target)
+                if (
+                    parsed.scheme != "https"
+                    or not parsed.hostname
+                    or parsed.username
+                    or any(character.isspace() for character in target)
+                    or len(target) > 2048
+                ):
+                    raise ValueError("Button URL must use HTTPS")
+                try:
+                    port = parsed.port
+                except ValueError:
+                    raise ValueError("Button URL has an invalid port") from None
+                if port == 0:
+                    raise ValueError("Button URL has an invalid port")
+                try:
+                    row_index = int(row_text)
+                except ValueError:
+                    raise ValueError("Invalid button row") from None
+                if not 1 <= row_index <= 4:
+                    raise ValueError("Invalid button row")
+                buttons.setdefault(row_index, []).append({"text": label, "url": target})
+            if any(len(row) > 8 for row in buttons.values()):
+                raise ValueError("Too many buttons in a row")
+            normalized_buttons = [
+                buttons[row] for row in sorted(buttons)
+            ]
+            photo_data = None
+            photo_mime = None
+            if photo is not None:
+                photo_data, photo_mime = photo
+                valid_signature = (
+                    photo_mime == "image/png" and photo_data.startswith(b"\x89PNG\r\n\x1a\n")
+                ) or (
+                    photo_mime == "image/jpeg" and photo_data.startswith(b"\xff\xd8\xff")
+                ) or (
+                    photo_mime == "image/webp"
+                    and photo_data[:4] == b"RIFF"
+                    and photo_data[8:12] == b"WEBP"
+                )
+                if not valid_signature:
+                    raise ValueError("Upload a PNG, JPEG, or WebP image")
+                if len(photo_data) > 10_000_000:
+                    raise ValueError("Image must be smaller than 10 MB")
+            if not body_html and photo_data is None:
+                raise ValueError("Add text or an image")
+            post_id = self.tickets.create_channel_post(
+                self.admin_ids[0],
+                body_html,
+                normalized_buttons,
+                photo_data,
+                photo_mime,
+            )
+            return self._redirect(
+                start_response, f"{ADMIN_POSTS_PATH}?created={post_id}"
+            )
+        if method != "GET":
+            return self._response(
+                start_response,
+                *_page("Метод не поддерживается", "<p>Используйте GET или POST.</p>", status=405),
+            )
+        query = parse_qs(environ.get("QUERY_STRING", ""))
+        created = query.get("created", [""])[0]
+        notice = (
+            f'<p class="notice">Черновик #{_escape(created)} сохранён. '
+            "Бот отправит владельцу предпросмотр для одобрения.</p>"
+            if re.fullmatch(r"[1-9][0-9]*", created)
+            else ""
+        )
+        button_fields = []
+        for index in range(8):
+            button_fields.append(
+                '<section class="card"><b>Кнопка '
+                f'{index + 1}</b><label for="label-{index}">Текст кнопки</label>'
+                f'<input id="label-{index}" name="button_label_{index}" maxlength="64">'
+                f'<label for="url-{index}">Ссылка (HTTPS)</label>'
+                f'<input id="url-{index}" name="button_url_{index}" type="url" '
+                'placeholder="https://example.com">'
+                f'<label for="row-{index}">Ряд (1–4)</label>'
+                f'<input id="row-{index}" name="button_row_{index}" type="number" '
+                'min="1" max="4" value="1"></section>'
+            )
+        cards = []
+        for post in self.tickets.channel_posts():
+            cards.append(
+                '<section class="card"><div class="toolbar"><b>'
+                f'#{int(post["post_id"])}</b><span class="muted">'
+                f'{_escape(post["status"])} · {_format_time(post["created_at"])}'
+                f'{" · с изображением" if post["has_photo"] else ""}</span></div>'
+                f'<p class="message">{_escape(post["body_html"])[:300]}</p></section>'
+            )
+        content = (
+            f'<a class="button secondary" href="{BASE_PATH}/admin">К обращениям</a>'
+            + notice
+            + '<section class="card"><p class="muted">Пост появится в канале только '
+            "после одобрения владельцем в Telegram. Для форматирования выделите "
+            "текст и используйте кнопки.</p>"
+            f'<form method="post" action="{ADMIN_POSTS_PATH}" enctype="multipart/form-data">'
+            '<input type="hidden" name="action" value="create_post">'
+            '<div class="toolbar">'
+            '<button class="secondary" type="button" data-command="bold"><b>Жирный</b></button>'
+            '<button class="secondary" type="button" data-command="italic"><i>Курсив</i></button>'
+            '<button class="secondary" type="button" data-command="underline"><u>Подчёркнутый</u></button>'
+            '<button class="secondary" type="button" data-command="strikeThrough">Зачёркнутый</button>'
+            '<button class="secondary" type="button" data-command="createLink">Ссылка</button>'
+            '</div><label for="post-editor">Текст поста</label>'
+            '<div id="post-editor" contenteditable="true" role="textbox" '
+            'aria-multiline="true" class="card" style="min-height:160px"></div>'
+            '<textarea id="body-html" name="body_html" hidden></textarea>'
+            '<label for="post-photo">Изображение (PNG, JPEG или WebP, до 10 МБ)</label>'
+            '<input id="post-photo" name="photo" type="file" accept="image/png,image/jpeg,image/webp">'
+            '<h2>Кнопки</h2>'
+            + "".join(button_fields)
+            + '<button type="submit">Отправить владельцу на одобрение</button></form></section>'
+            + "<h2>Последние посты</h2>"
+            + ("".join(cards) if cards else '<section class="card"><p>Постов пока нет.</p></section>')
+            + '<script>'
+            'const editor=document.getElementById("post-editor");'
+            'document.querySelectorAll("[data-command]").forEach(button=>button.addEventListener("click",()=>{'
+            'const command=button.dataset.command;'
+            'if(command==="createLink"){const url=prompt("HTTPS-ссылка");'
+            'if(url)document.execCommand(command,false,url)}else document.execCommand(command,false,null);'
+            'editor.focus()}));'
+            'document.querySelector("form").addEventListener("submit",()=>{'
+            'document.getElementById("body-html").value=editor.innerHTML});'
+            '</script>'
+        )
+        return self._response(start_response, *_page("Публикации канала", content))
 
     def _messages_html(
         self, ticket_id: int, *, admin: bool, page: int, page_url: str
@@ -679,15 +972,29 @@ class TicketPortalApp:
 
 def _admin_ids_from_env() -> tuple[int, ...]:
     try:
-        return tuple(
+        admin_ids = list(
             dict.fromkeys(
-                int(value.strip())
-                for value in os.environ["BOT_ADMIN_IDS"].split(",")
+                int(value.strip()) for value in os.environ["BOT_ADMIN_IDS"].split(",")
                 if value.strip()
             )
         )
     except (KeyError, ValueError):
         raise RuntimeError("BOT_ADMIN_IDS must contain Telegram administrator IDs") from None
+    if not admin_ids:
+        raise RuntimeError("BOT_ADMIN_IDS must contain Telegram administrator IDs")
+    owner_id = os.environ.get("BOT_OWNER_ID", "").strip()
+    if not owner_id:
+        owner = min(admin_ids)
+    else:
+        try:
+            owner = int(owner_id)
+        except ValueError:
+            raise RuntimeError("BOT_OWNER_ID must be a Telegram administrator ID") from None
+        if owner not in admin_ids:
+            raise RuntimeError("BOT_OWNER_ID must be included in BOT_ADMIN_IDS")
+        admin_ids.remove(owner)
+        admin_ids.insert(0, owner)
+    return tuple(admin_ids)
 
 
 def run() -> None:
@@ -727,7 +1034,7 @@ def run() -> None:
         server_class=WSGIServer,
         handler_class=RedactingRequestHandler,
     )
-    server.logger = logging.getLogger("ticket_portal.http")
+    setattr(server, "logger", logging.getLogger("ticket_portal.http"))
     logging.info("Ticket portal listening on its private container network")
     server.serve_forever()
 

@@ -16,11 +16,12 @@ MESSAGES: dict[str, object] = {
     "common.devices": "📱 Мои устройства",
     "common.stats": "📊 Статистика",
     "common.plans": "💎 Тарифы",
-    "common.subscription": "📄 Моя подписка",
+    "common.subscription": "👤 Личный кабинет",
     "common.cabinet": "👤 Личный кабинет",
     "common.connect": "🔌 Подключить VPN",
     "common.trial": "🎁 Получить пробный доступ",
     "common.cancel": "✖️ Отмена",
+    "common.confirm": "✅ Подтвердить",
     "common.friend": "друг",
     "common.hide": "🙈 Скрыть",
     "common.page": "Страница",
@@ -128,7 +129,7 @@ MESSAGES: dict[str, object] = {
     "referral.link": "Ваша ссылка:\n<code>{link}</code>",
     "referral.share": "Поделиться приглашением",
     "referral.new_visit": (
-        "По вашей ссылке пришёл новый пользователь Jopes VPN. "
+        "Пользователь перешёл по вашей ссылке. "
         "Реферальное начисление появится после его покупки или пополнения баланса."
     ),
     "referral.unavailable": "Статистика приглашений сейчас недоступна.",
@@ -145,13 +146,24 @@ MESSAGES: dict[str, object] = {
         "Реферальное начисление будет зачислено после подтверждения оплаты."
     ),
 
-    "wallet.title": "💰 БАЛАНС",
+    "wallet.title": "💳 ИСТОРИЯ ПЛАТЕЖЕЙ",
     "wallet.balance_title": "Средства",
     "wallet.balance_row": "Рублёвый баланс: {amount}",
     "wallet.referral_row": "Реферальный доход: {amount}",
     "wallet.withdrawable_row": "Доступно к выводу: {amount}",
     "wallet.pending_row": "Заявка на вывод: {amount} · № {request_id}",
     "wallet.history_title": "История операций",
+    "wallet.payment_history_title": "Платежи и операции",
+    "wallet.history_bonus": "Бонус пополнения",
+    "wallet.history_adjustment": "Корректировка баланса",
+    "wallet.history_subscription_refund": "Возврат покупки подписки",
+    "wallet.history_withdrawal": "Вывод реферального дохода",
+    "wallet.history_method_admin": "Администратор",
+    "wallet.history_method_bonus": "Бонус",
+    "wallet.history_success": "Успешно",
+    "wallet.history_confirmed": "Обрабатывается",
+    "wallet.history_review": "Проверяется поддержкой",
+    "wallet.history_refunded": "Возвращено",
     "wallet.history_empty": "Операций пока нет.",
     "wallet.history_row": "{label}: <b>{amount}</b> · {date}",
     "wallet.kind_topup": "Пополнение",
@@ -160,6 +172,15 @@ MESSAGES: dict[str, object] = {
     "wallet.kind_topup_refund": "Возврат пополнения",
     "wallet.kind_referral_refund": "Корректировка начисления",
     "wallet.kind_withdrawal": "Вывод средств",
+    "wallet.kind_withdrawal_return": "Возврат отклонённой заявки",
+    "wallet.kind_refund_debt": "Долг по возврату",
+    "wallet.kind_refund_debt_settlement": "Погашение долга возврата",
+    "wallet.kind_referral_debt_settlement": "Зачёт возврата комиссии",
+    "wallet.refund_debt_row": "Задолженность по возврату: {amount}",
+    "wallet.referral_debt_row": (
+        "Корректировка реферального дохода: {amount} "
+        "(зачтётся из будущих начислений)"
+    ),
     "wallet.kind_other": "Операция",
     "wallet.note": (
         "Рублёвый баланс оплачивает тарифы. Реферальный доход хранится "
@@ -194,8 +215,31 @@ MESSAGES: dict[str, object] = {
         "Счёт на {amount} отправлен. После оплаты сумма появится на балансе."
     ),
     "wallet.topup_success": (
-        "✅ Баланс пополнен на {amount}. Доступный баланс: {balance}."
+        "✅ Пополнение подтверждено: {amount}. Бонус: {bonus}. "
+        "Доступный баланс: {balance}."
     ),
+    "wallet.pay_stars": "Оплатить Telegram Stars · {stars} ⭐",
+    "wallet.payment_method_prompt": (
+        "Сумма пополнения: <b>{amount}</b>\n"
+        "К оплате: <b>{stars} ⭐</b> по курсу каталога.\n"
+        "Доступен только Telegram Stars; другие способы оплаты не подключены."
+    ),
+    "wallet.receipt": (
+        "\n\n<b>Чек операции</b>\n"
+        "ID: <code>{operation_id}</code>\n"
+        "Операция: {operation}\n"
+        "Сумма: {amount}\n"
+        "Способ: {method}\n"
+        "Результат: {result}\n"
+        "Сохраните чек и номер операции для обращения в поддержку."
+    ),
+    "wallet.receipt_topup": "Пополнение баланса",
+    "wallet.receipt_subscription": "Покупка подписки",
+    "wallet.receipt_withdrawal": "Вывод реферального дохода",
+    "wallet.receipt_method_stars": "Telegram Stars",
+    "wallet.receipt_method_balance": "Баланс в рублях",
+    "wallet.receipt_method_manual": "Через поддержку",
+    "wallet.receipt_result_success": "Успешно",
     "wallet.topup_review": (
         "Оплата получена, но зачисление задержалось. Мы проверим операцию; "
         "повторно оплачивать не нужно."
@@ -206,7 +250,7 @@ MESSAGES: dict[str, object] = {
     ),
     "wallet.refund_user_notice": (
         "Возврат пополнения выполнен. Сумма списана с рублёвого баланса. "
-        "Если баланс уже израсходован, поддержка поможет урегулировать разницу."
+        "Не покрытая балансом часть будет зачтена из следующих пополнений."
     ),
     "wallet.withdraw_intro": (
         "Доступно к выводу: {amount}. Заявка будет передана в поддержку. "
@@ -227,6 +271,20 @@ MESSAGES: dict[str, object] = {
         "Сумма: {amount}\n"
         "Выплата выполняется вручную после согласования реквизитов."
     ),
+    "wallet.withdraw_mark_paid": "✅ Выплачено",
+    "wallet.withdraw_reject": "↩️ Отклонить и вернуть",
+    "wallet.withdraw_paid_user": (
+        "✅ Заявка на вывод {amount} выплачена поддержкой."
+    ),
+    "wallet.withdraw_rejected_user": (
+        "Заявка на вывод отклонена. {amount} возвращены в доступный "
+        "реферальный доход."
+    ),
+    "wallet.withdraw_settled": "Заявка отмечена как выплаченная.",
+    "wallet.withdraw_rejected": (
+        "Заявка отклонена; сумма возвращена пользователю."
+    ),
+    "wallet.withdraw_already_settled": "Заявка уже обработана.",
     "wallet.withdraw_pending_error": (
         "Заявка на вывод уже отправлена. Дождитесь ответа поддержки."
     ),
@@ -260,6 +318,58 @@ MESSAGES: dict[str, object] = {
     "admin.users": "👥 Все пользователи",
     "admin.logs": "📡 Логи подключений",
     "admin.broadcast": "📣 Рассылка",
+    "admin.wallet_menu": "💰 Балансы и бонусы",
+    "admin.wallet_title": "<b>Баланс пользователей и бонусы пополнения</b>",
+    "admin.wallet_adjust_button": "Изменить баланс пользователя",
+    "admin.wallet_bonus_button": "Настроить бонус пополнения",
+    "admin.wallet_payment_lookup": "Найти платёж по ID",
+    "admin.wallet_payment_lookup_prompt": (
+        "Отправьте ID операции, ID платежа Telegram или ID записи."
+    ),
+    "admin.wallet_payment_not_found": "Платёж с таким ID не найден.",
+    "admin.wallet_payment_found": (
+        "Операция <code>{operation_id}</code>\n"
+        "Пользователь: <code>{telegram_id}</code>\n"
+        "Сумма: {amount}\nМетод: {method}\nНазначение: {purpose}\n"
+        "Статус: {status}\nСоздана: {created_at}"
+    ),
+    "admin.wallet_adjust_prompt": (
+        "Отправьте ID пользователя, сумму и обязательную причину через пробел. "
+        "Для списания укажите сумму со знаком минус.\n"
+        "Пример: <code>123456789 50.25 компенсация</code>"
+    ),
+    "admin.wallet_adjust_invalid": (
+        "Неверные данные. Укажите ID, сумму с точностью до копеек и причину "
+        "не длиннее 300 символов."
+    ),
+    "admin.wallet_adjust_preview": (
+        "Изменить баланс пользователя <code>{telegram_id}</code>?\n"
+        "Действие: {direction} {amount}.\nПричина: {reason}"
+    ),
+    "admin.wallet_adjust_done": (
+        "Баланс пользователя <code>{telegram_id}</code> изменён на {amount}. "
+        "Операция: <code>{operation_id}</code>."
+    ),
+    "admin.wallet_already_applied": "Операция уже была применена.",
+    "admin.wallet_operation_failed": (
+        "Операция не выполнена. Проверьте баланс пользователя и попробуйте снова."
+    ),
+    "admin.wallet_bonus_prompt": (
+        "Отправьте <code>fixed сумма_в_рублях</code> или "
+        "<code>percent целое_число</code> (до 100%).\n"
+        "Пример: <code>fixed 50</code> или <code>percent 10</code>. "
+        "Новое правило применяется к следующим подтверждённым пополнениям."
+    ),
+    "admin.wallet_bonus_invalid": (
+        "Неверный бонус. Фиксированная сумма должна быть положительной, "
+        "процент — целым числом от 1 до 100."
+    ),
+    "admin.wallet_bonus_preview": (
+        "Установить бонус к будущим пополнениям: <b>{value}</b>?"
+    ),
+    "admin.wallet_bonus_done": "Настройка бонуса обновлена: {value}.",
+    "admin.wallet_cancelled": "Операция отменена.",
+    "admin.wallet_invalid": "Действие истекло. Начните его заново.",
     "admin.broadcast_send": "✅ Отправить всем",
     "admin.broadcast_prompt": (
         "Пришлите сообщение для рассылки. Можно отправить текст или медиа; "
@@ -1024,7 +1134,8 @@ MESSAGES: dict[str, object] = {
     ),
     "about.document_missing": "Ссылка на этот документ пока не настроена.",
     "free.daily_report": (
-        "📊 <b>FREE · статистика за прошлые сутки</b>\n"
+        "✅ Суточная квота FREE обновлена: {quota}.\n"
+        "📊 <b>Статистика за прошлые сутки</b>\n"
         "Период начался: {day}\n\n"
         "Использовано: {used}\n"
         "Квота на сутки: {quota}\n"
