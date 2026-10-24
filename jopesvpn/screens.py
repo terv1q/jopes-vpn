@@ -236,7 +236,10 @@ async def edit_screen(
             except (PreferencesError, ValueError):
                 logger.warning("Banner navigation context could not be read")
         name = banner_for_callback(f"user:{target}") or "home"
-    if getattr(message, "photo", None) is not None:
+    if (
+        getattr(message, "photo", None) is not None
+        or getattr(message, "animation", None) is not None
+    ):
         if name is not None and _can_use_banner(name, prefs, text):
             if await _edit_photo(message, name, prefs, strip_heading(text), markup):
                 return

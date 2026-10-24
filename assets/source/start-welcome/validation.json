@@ -1,0 +1,17 @@
+{
+  "sha256": "9210accf9e8eb8e376a8bcdd9a284a61e62deba465f54ebdc3f9c79c1c854c63",
+  "bytes": 1356869,
+  "format": "GIF",
+  "dimensions": [
+    1280,
+    640
+  ],
+  "frames": 59,
+  "duration_ms": 7200,
+  "loop": 0,
+  "monochrome": true,
+  "blank_ms": 280,
+  "unique_frames": 57,
+  "frames_touching_edges": [],
+  "same_loop_boundary": true
+}

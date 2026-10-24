@@ -1721,6 +1721,25 @@ class PreferencesStore:
         except sqlite3.Error as error:
             raise PreferencesError("Cannot mark connection log as delivered") from error
 
+    def connection_last_seen(self, telegram_id: int) -> str | None:
+        if telegram_id <= 0:
+            return None
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    """
+                    SELECT MAX(last_seen_at) AS last_seen_at
+                    FROM connection_log_endpoints
+                    WHERE telegram_id = ?
+                    """,
+                    (telegram_id,),
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot read connection endpoints") from error
+        if row is None or row["last_seen_at"] is None:
+            return None
+        return str(row["last_seen_at"])
+
     def accounts_on_ip(self, ip: str, *, since_hours: int = 24) -> list[int]:
         if not ip:
             return []

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import logging
 import shlex
 import uuid
@@ -11,15 +13,38 @@ from typing import cast
 from urllib.parse import urlsplit
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
+from jopesvpn.broadcasts import (
+    AUDIENCES,
+    DRAFT,
+    FAILED,
+    MAX_BUTTONS,
+    SENDING,
+    SENT,
+    BroadcastDraft,
+    BroadcastError,
+    BroadcastStore,
+    broadcast_user_keyboard,
+    parse_mode_for,
+    resolve_audience,
+    send_broadcast,
+    validate_button,
+)
 from jopesvpn.config import Settings
 from jopesvpn.connection_logs import POLL_INTERVAL_SECONDS, baseline
 from jopesvpn.i18n import t, tn
+from jopesvpn.orders import OrderError, OrderStore
 from jopesvpn.panel import (
     PanelAccessDenied,
     PanelDataError,
@@ -29,6 +54,7 @@ from jopesvpn.panel import (
     RemnawaveClient,
 )
 from jopesvpn.plans import format_rubles
+from jopesvpn.platega import PlategaClient, PlategaError
 from jopesvpn.preferences import PreferencesError, PreferencesStore
 from jopesvpn.screens import answer_screen, edit_screen
 from jopesvpn.timezones import (
@@ -50,21 +76,30 @@ from jopesvpn.ui import (
     admin_users_keyboard,
     admin_users_text,
     back_keyboard,
-    broadcast_keyboard,
+    broadcast_audience_keyboard,
+    broadcast_audience_label,
+    broadcast_buttons_keyboard,
+    broadcast_control_keyboard,
+    broadcast_send_keyboard,
+    broadcast_status_label,
+    broadcasts_keyboard,
     confirm_extend_keyboard,
     confirm_grant_keyboard,
     confirm_keyboard,
     format_bytes,
+    payment_method_text,
+    platega_admin_keyboard,
     status_text,
     tariff_text,
     wallet_admin_confirm_keyboard,
     wallet_admin_keyboard,
 )
-from jopesvpn.wallet import MAX_TOPUP_MINOR, WalletError, WalletStore
+from jopesvpn.wallet import MAX_MANUAL_BALANCE_MINOR, WalletError, WalletStore
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin")
 _mutation_lock = asyncio.Lock()
+_broadcast_lock = asyncio.Lock()
 ADMIN_TAG = "ADMIN"
 
 
@@ -81,6 +116,8 @@ class AdminFlow(StatesGroup):
 
 class BroadcastFlow(StatesGroup):
     message = State()
+    button_label = State()
+    button_url = State()
 
 
 class DocumentsFlow(StatesGroup):
@@ -121,6 +158,62 @@ def _parse_admin_rubles(raw: str) -> int | None:
     return int(amount * 100)
 
 
+def _platega_payments_text(wallet: WalletStore, status: str) -> str:
+    selected_status = None if status == "ALL" else status
+    transactions = wallet.payment_transactions(
+        method="platega", status=selected_status, limit=50
+    )
+    summary = wallet.payment_transaction_summary(method="platega")
+    summary_text = "\n".join(
+        f"{row_status}: {count} · {format_rubles(amount)}"
+        for row_status, count, amount in summary
+    ) or "Онлайн-платежей пока нет."
+    detail_rows = [
+        (
+            f"<code>{escape(item.id)}</code> · {item.telegram_id}\n"
+            f"{format_rubles(item.rub_amount_minor)} · "
+            f"{escape(item.purpose)} · {escape(item.status)} · "
+            f"{escape(item.created_at)}"
+        )
+        for item in transactions
+    ]
+    details = "\n\n".join(detail_rows) or "Нет операций для выбранного фильтра."
+    return (
+        "<b>Онлайн-платежи</b>\n"
+        f"Статистика:\n{summary_text}\n\n"
+        f"Операции ({len(transactions)} последних):\n{details}"
+    )
+
+
+def _platega_transactions_csv(transactions) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(
+        (
+            "payment_id",
+            "telegram_id",
+            "amount_minor",
+            "currency",
+            "purpose",
+            "status",
+            "created_at",
+        )
+    )
+    for item in transactions:
+        writer.writerow(
+            (
+                item.id,
+                item.telegram_id,
+                item.rub_amount_minor,
+                "RUB",
+                item.purpose,
+                item.status,
+                item.created_at,
+            )
+        )
+    return output.getvalue().encode("utf-8-sig")
+
+
 @router.message(WalletAdminFlow.adjust_input)
 async def receive_wallet_adjustment(
     message: Message,
@@ -149,7 +242,7 @@ async def receive_wallet_adjustment(
     if telegram_id <= 0 or amount_minor in (None, 0) or not reason:
         await message.answer(t("admin.wallet_adjust_invalid"))
         return
-    if abs(amount_minor) > MAX_TOPUP_MINOR or len(reason) > 300:
+    if abs(amount_minor) > MAX_MANUAL_BALANCE_MINOR or len(reason) > 300:
         await message.answer(t("admin.wallet_adjust_invalid"))
         return
     assert message.from_user is not None
@@ -264,7 +357,7 @@ async def receive_wallet_payment_lookup(
             operation_id=escape(payment.id),
             telegram_id=payment.telegram_id,
             amount=amount,
-            method=escape(payment.method),
+            method=escape(payment_method_text(payment.method)),
             purpose=escape(payment.purpose),
             status=escape(payment.status),
             created_at=escape(payment.created_at),
@@ -341,36 +434,481 @@ async def confirm_wallet_admin_action(
     await _edit(callback, result, admin_keyboard())
 
 
+def _broadcast_control_text(draft: BroadcastDraft) -> str:
+    lines = [
+        t("admin.bcast_control_title", id=draft.id),
+        "",
+        t(
+            "admin.bcast_status_line",
+            status=broadcast_status_label(draft.status),
+        ),
+        t(
+            "admin.bcast_audience_line",
+            audience=broadcast_audience_label(draft.audience),
+        ),
+        t("admin.bcast_buttons_line", count=len(draft.buttons)),
+    ]
+    if draft.status in {SENT, FAILED}:
+        lines.append(
+            t(
+                "admin.bcast_delivery_line",
+                delivered=draft.delivered,
+                failed=draft.failed,
+            )
+        )
+    lines.extend(["", t("admin.bcast_control_note")])
+    return "\n".join(lines)
+
+
+async def _send_broadcast_preview(
+    bot: Bot, chat_id: int, draft: BroadcastDraft
+) -> bool:
+    try:
+        await bot.send_message(
+            chat_id,
+            draft.text,
+            parse_mode=parse_mode_for(draft.text),
+            reply_markup=broadcast_user_keyboard(draft.buttons),
+        )
+    except TelegramAPIError:
+        return False
+    return True
+
+
+async def _open_broadcast_screen(
+    message: Message, draft: BroadcastDraft, *, with_preview: bool = True
+) -> None:
+    if with_preview:
+        try:
+            await message.answer(
+                draft.text,
+                parse_mode=parse_mode_for(draft.text),
+                reply_markup=broadcast_user_keyboard(draft.buttons),
+            )
+        except TelegramAPIError:
+            await message.answer(t("admin.bcast_html_invalid"))
+            return
+    await message.answer(
+        _broadcast_control_text(draft),
+        reply_markup=broadcast_control_keyboard(draft),
+        parse_mode="HTML",
+    )
+
+
+def _load_broadcast(
+    store: BroadcastStore | None, draft_id: int
+) -> BroadcastDraft | None:
+    if store is None:
+        return None
+    try:
+        return store.get(draft_id)
+    except BroadcastError:
+        return None
+
+
 @router.message(BroadcastFlow.message)
 async def receive_broadcast_message(
     message: Message,
     bot: Bot,
     settings: Settings,
     state: FSMContext,
+    broadcasts: BroadcastStore | None = None,
 ) -> None:
     if not _private_admin(message, settings):
         await state.clear()
         await message.answer(t("admin.command_unavailable"))
         return
-    if message.text and message.text.strip().lower() in {"/cancel", "отмена"}:
+    if broadcasts is None:
         await state.clear()
-        await message.answer(t("admin.broadcast_cancelled"))
+        await message.answer(t("admin.bcast_unavailable"))
         return
-    await state.update_data(
-        broadcast_chat_id=message.chat.id,
-        broadcast_message_id=message.message_id,
-    )
+    if (message.text or "").strip().casefold() in {"/cancel", "отмена"}:
+        await state.clear()
+        await message.answer(
+            t("admin.bcast_cancelled"), reply_markup=admin_keyboard()
+        )
+        return
+    text = (message.text or "").strip()
+    if not text or len(text) > 4096:
+        await message.answer(t("admin.bcast_text_invalid"))
+        return
+    data = await state.get_data()
+    raw_id = data.get("broadcast_id")
     try:
-        await bot.copy_message(
-            chat_id=message.chat.id,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-            reply_markup=broadcast_keyboard(),
+        if isinstance(raw_id, int):
+            broadcasts.update_text(raw_id, text)
+            draft = broadcasts.get(raw_id)
+        else:
+            draft = broadcasts.create(message.from_user.id, text)
+    except BroadcastError:
+        logger.warning("Broadcast draft could not be saved")
+        await state.clear()
+        await message.answer(t("admin.bcast_unavailable"), reply_markup=admin_keyboard())
+        return
+    if draft is None:
+        await state.clear()
+        await message.answer(t("admin.bcast_not_found"), reply_markup=admin_keyboard())
+        return
+    await state.clear()
+    if not await _send_broadcast_preview(bot, message.chat.id, draft):
+        await state.update_data(broadcast_id=draft.id)
+        await state.set_state(BroadcastFlow.message)
+        await message.answer(t("admin.bcast_html_invalid"))
+        return
+    await message.answer(
+        _broadcast_control_text(draft),
+        reply_markup=broadcast_control_keyboard(draft),
+        parse_mode="HTML",
+    )
+
+
+@router.message(BroadcastFlow.button_label)
+async def receive_broadcast_button_label(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+    broadcasts: BroadcastStore | None = None,
+) -> None:
+    if not _private_admin(message, settings):
+        await state.clear()
+        await message.answer(t("admin.command_unavailable"))
+        return
+    data = await state.get_data()
+    raw_id = data.get("broadcast_id")
+    draft_id = raw_id if isinstance(raw_id, int) else 0
+    if (message.text or "").strip().casefold() in {"/cancel", "отмена"}:
+        await state.clear()
+        draft = _load_broadcast(broadcasts, draft_id)
+        if draft is not None:
+            await _open_broadcast_screen(message, draft, with_preview=False)
+        else:
+            await message.answer(t("admin.bcast_cancelled"))
+        return
+    label = (message.text or "").strip()
+    if not label or len(label) > 64:
+        await message.answer(t("admin.bcast_button_label_invalid"))
+        return
+    await state.update_data(button_label=label)
+    await state.set_state(BroadcastFlow.button_url)
+    await message.answer(t("admin.bcast_button_url_prompt"))
+
+
+@router.message(BroadcastFlow.button_url)
+async def receive_broadcast_button_url(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+    broadcasts: BroadcastStore | None = None,
+) -> None:
+    if not _private_admin(message, settings):
+        await state.clear()
+        await message.answer(t("admin.command_unavailable"))
+        return
+    data = await state.get_data()
+    raw_id = data.get("broadcast_id")
+    draft_id = raw_id if isinstance(raw_id, int) else 0
+    if (message.text or "").strip().casefold() in {"/cancel", "отмена"}:
+        await state.clear()
+        draft = _load_broadcast(broadcasts, draft_id)
+        if draft is not None:
+            await _open_broadcast_screen(message, draft)
+        else:
+            await message.answer(t("admin.bcast_cancelled"))
+        return
+    label = data.get("button_label")
+    if not isinstance(label, str):
+        await state.clear()
+        await message.answer(t("admin.bcast_button_invalid"))
+        return
+    try:
+        button = validate_button(label, message.text or "")
+    except BroadcastError:
+        await message.answer(t("admin.bcast_button_invalid"))
+        return
+    draft = _load_broadcast(broadcasts, draft_id)
+    if broadcasts is None or draft is None:
+        await state.clear()
+        await message.answer(t("admin.bcast_not_found"))
+        return
+    if len(draft.buttons) >= MAX_BUTTONS:
+        await state.clear()
+        await message.answer(t("admin.bcast_buttons_limit"))
+        await _open_broadcast_screen(message, draft)
+        return
+    try:
+        broadcasts.set_buttons(
+            draft_id, [*draft.buttons, button]
+        )
+    except BroadcastError:
+        await state.clear()
+        await message.answer(t("admin.bcast_unavailable"))
+        return
+    await state.clear()
+    updated = _load_broadcast(broadcasts, draft_id)
+    if updated is None:
+        await message.answer(t("admin.bcast_not_found"))
+        return
+    await message.answer(t("admin.bcast_button_added"))
+    await _open_broadcast_screen(message, updated)
+
+
+async def _broadcasts_screen(
+    callback: CallbackQuery, broadcasts: BroadcastStore | None
+) -> None:
+    if broadcasts is None:
+        await callback.answer(t("admin.bcast_unavailable"), show_alert=True)
+        return
+    try:
+        drafts = broadcasts.list_recent()
+    except BroadcastError:
+        await callback.answer(t("admin.bcast_unavailable"), show_alert=True)
+        return
+    lines = [t("admin.broadcasts_title")]
+    if not drafts:
+        lines.extend(["", t("admin.bcast_empty")])
+    await _edit(callback, "\n".join(lines), broadcasts_keyboard(drafts))
+
+
+async def _broadcast_open(
+    callback: CallbackQuery, broadcasts: BroadcastStore | None, draft_id: int
+) -> None:
+    if broadcasts is None or callback.message is None:
+        await callback.answer(t("admin.bcast_unavailable"), show_alert=True)
+        return
+    draft = _load_broadcast(broadcasts, draft_id)
+    if draft is None:
+        await callback.answer(t("admin.bcast_not_found"), show_alert=True)
+        return
+    await callback.answer()
+    try:
+        await callback.message.answer(
+            draft.text,
+            parse_mode=parse_mode_for(draft.text),
+            reply_markup=broadcast_user_keyboard(draft.buttons),
         )
     except TelegramAPIError:
-        await state.clear()
-        logger.warning("Broadcast preview could not be sent")
-        await message.answer(t("admin.broadcast_preview_failed"))
+        await callback.message.answer(t("admin.bcast_html_invalid"))
+    await _edit(
+        callback,
+        _broadcast_control_text(draft),
+        broadcast_control_keyboard(draft),
+    )
+
+
+async def _broadcast_audience_screen(
+    callback: CallbackQuery, broadcasts: BroadcastStore | None, draft_id: int
+) -> None:
+    draft = _load_broadcast(broadcasts, draft_id)
+    if draft is None:
+        await callback.answer(t("admin.bcast_not_found"), show_alert=True)
+        return
+    await callback.answer()
+    await _edit(
+        callback,
+        t("admin.bcast_audience_title"),
+        broadcast_audience_keyboard(draft_id, draft.audience),
+    )
+
+
+async def _broadcast_set_audience(
+    callback: CallbackQuery,
+    broadcasts: BroadcastStore | None,
+    draft_id: int,
+    audience: str,
+) -> None:
+    if audience not in AUDIENCES:
+        await callback.answer(t("admin.bcast_audience_invalid"), show_alert=True)
+        return
+    draft = _load_broadcast(broadcasts, draft_id)
+    if broadcasts is None or draft is None:
+        await callback.answer(t("admin.bcast_not_found"), show_alert=True)
+        return
+    try:
+        broadcasts.set_audience(draft_id, audience)
+    except BroadcastError:
+        await callback.answer(t("admin.bcast_unavailable"), show_alert=True)
+        return
+    updated = _load_broadcast(broadcasts, draft_id)
+    if updated is None:
+        await callback.answer(t("admin.bcast_not_found"), show_alert=True)
+        return
+    await callback.answer(t("admin.bcast_audience_saved"))
+    await _edit(
+        callback,
+        _broadcast_control_text(updated),
+        broadcast_control_keyboard(updated),
+    )
+
+
+async def _broadcast_buttons_screen(
+    callback: CallbackQuery, broadcasts: BroadcastStore | None, draft_id: int
+) -> None:
+    draft = _load_broadcast(broadcasts, draft_id)
+    if draft is None:
+        await callback.answer(t("admin.bcast_not_found"), show_alert=True)
+        return
+    lines = [t("admin.bcast_buttons_title")]
+    if draft.buttons:
+        lines.append("")
+        lines.extend(
+            t(
+                "admin.bcast_buttons_list",
+                index=index,
+                label=escape(button.text),
+                url=escape(button.url),
+            )
+            for index, button in enumerate(draft.buttons, start=1)
+        )
+    else:
+        lines.extend(["", t("admin.bcast_buttons_empty")])
+    await callback.answer()
+    await _edit(
+        callback,
+        "\n".join(lines),
+        broadcast_buttons_keyboard(draft_id, len(draft.buttons)),
+    )
+
+
+async def _broadcast_confirm(
+    callback: CallbackQuery,
+    panel: RemnawaveClient,
+    settings: Settings,
+    prefs: PreferencesStore | None,
+    broadcasts: BroadcastStore | None,
+    draft_id: int,
+) -> None:
+    draft = _load_broadcast(broadcasts, draft_id)
+    if draft is None or broadcasts is None or prefs is None:
+        await callback.answer(t("admin.bcast_not_found"), show_alert=True)
+        return
+    if draft.status == SENT:
+        await callback.answer(t("admin.bcast_already_sent"), show_alert=True)
+        return
+    await callback.answer()
+    try:
+        result = await resolve_audience(
+            panel,
+            prefs,
+            draft.audience,
+            exclude=settings.admin_telegram_ids,
+        )
+    except BroadcastError:
+        await _edit(callback, t("admin.bcast_unavailable"), admin_keyboard())
+        return
+    if not result.recipients:
+        await _edit(
+            callback,
+            t("admin.bcast_no_recipients"),
+            broadcast_control_keyboard(draft),
+        )
+        return
+    lines = [
+        t("admin.bcast_confirm_title"),
+        "",
+        t(
+            "admin.bcast_confirm_audience",
+            audience=broadcast_audience_label(draft.audience),
+        ),
+        t("admin.bcast_confirm_recipients", count=len(result.recipients)),
+    ]
+    if result.errors:
+        lines.append(
+            t("admin.bcast_confirm_errors", errors=result.errors)
+        )
+    lines.append(t("admin.bcast_confirm_buttons", count=len(draft.buttons)))
+    await _edit(callback, "\n".join(lines), broadcast_send_keyboard(draft_id))
+
+
+async def _broadcast_launch(
+    callback: CallbackQuery,
+    bot: Bot,
+    panel: RemnawaveClient,
+    settings: Settings,
+    prefs: PreferencesStore | None,
+    broadcasts: BroadcastStore | None,
+    draft_id: int,
+) -> None:
+    if broadcasts is None or prefs is None:
+        await callback.answer(t("admin.bcast_unavailable"), show_alert=True)
+        return
+    if _broadcast_lock.locked():
+        await callback.answer(t("admin.bcast_busy"), show_alert=True)
+        return
+    async with _broadcast_lock:
+        draft = _load_broadcast(broadcasts, draft_id)
+        if draft is None:
+            await callback.answer(t("admin.bcast_not_found"), show_alert=True)
+            return
+        if draft.status == SENT:
+            await callback.answer(t("admin.bcast_already_sent"), show_alert=True)
+            return
+        try:
+            broadcasts.set_status(draft_id, SENDING)
+        except BroadcastError:
+            await callback.answer(t("admin.bcast_unavailable"), show_alert=True)
+            return
+        await callback.answer()
+        if callback.message is not None:
+            await edit_screen(
+                cast(Message, callback.message),
+                t("admin.bcast_launch_progress", id=draft_id),
+                None,
+            )
+        try:
+            result = await resolve_audience(
+                panel,
+                prefs,
+                draft.audience,
+                exclude=settings.admin_telegram_ids,
+            )
+        except BroadcastError:
+            broadcasts.set_status(draft_id, DRAFT)
+            await _edit(callback, t("admin.bcast_unavailable"), admin_keyboard())
+            return
+        if not result.recipients:
+            broadcasts.set_status(draft_id, DRAFT)
+            refreshed = _load_broadcast(broadcasts, draft_id)
+            await _edit(
+                callback,
+                t("admin.bcast_no_recipients"),
+                broadcast_control_keyboard(refreshed)
+                if refreshed is not None
+                else admin_keyboard(),
+            )
+            return
+        try:
+            delivery = await send_broadcast(
+                bot, broadcasts, draft, result.recipients
+            )
+        except BroadcastError:
+            broadcasts.set_status(draft_id, FAILED)
+            await _edit(callback, t("admin.bcast_unavailable"), admin_keyboard())
+            return
+        delivered, failed = broadcasts.delivery_counts(draft_id)
+        status = SENT if delivered > 0 or failed == 0 else FAILED
+        broadcasts.set_status(
+            draft_id, status, delivered=delivered, failed=failed
+        )
+        refreshed = _load_broadcast(broadcasts, draft_id)
+        markup = (
+            broadcast_control_keyboard(refreshed)
+            if refreshed is not None
+            else admin_keyboard()
+        )
+        lines = [
+            t(
+                "admin.bcast_result",
+                id=draft_id,
+                delivered=delivery.delivered,
+                failed=delivery.failed,
+                skipped=delivery.skipped,
+            )
+        ]
+        if refreshed is not None and result.errors:
+            lines.append(
+                t("admin.bcast_confirm_errors", errors=result.errors)
+            )
+        await _edit(callback, "\n".join(lines), markup)
 
 
 @router.message(DocumentsFlow.url)
@@ -429,73 +967,6 @@ async def receive_document_url(
         return
     await state.clear()
     await message.answer(t("docs.admin_saved"), reply_markup=admin_keyboard())
-
-
-async def _send_broadcast(
-    callback: CallbackQuery,
-    bot: Bot,
-    settings: Settings,
-    state: FSMContext,
-    prefs: PreferencesStore | None,
-) -> None:
-    data = await state.get_data()
-    source_chat_id = data.get("broadcast_chat_id")
-    source_message_id = data.get("broadcast_message_id")
-    await state.clear()
-    if (
-        not isinstance(source_chat_id, int)
-        or not isinstance(source_message_id, int)
-        or callback.message is None
-        or prefs is None
-    ):
-        await callback.answer(t("admin.broadcast_unavailable"), show_alert=True)
-        return
-    try:
-        recipients = [
-            telegram_id
-            for telegram_id in prefs.known_users()
-            if telegram_id not in settings.admin_telegram_ids
-        ]
-    except PreferencesError:
-        logger.warning("Broadcast recipients could not be loaded")
-        await callback.answer(t("admin.broadcast_unavailable"), show_alert=True)
-        return
-
-    await callback.answer()
-    delivered = 0
-    failed = 0
-    for telegram_id in recipients:
-        try:
-            await bot.copy_message(
-                chat_id=telegram_id,
-                from_chat_id=source_chat_id,
-                message_id=source_message_id,
-            )
-        except TelegramRetryAfter as error:
-            await asyncio.sleep(error.retry_after)
-            try:
-                await bot.copy_message(
-                    chat_id=telegram_id,
-                    from_chat_id=source_chat_id,
-                    message_id=source_message_id,
-                )
-            except TelegramAPIError:
-                failed += 1
-            else:
-                delivered += 1
-        except TelegramAPIError:
-            failed += 1
-        else:
-            delivered += 1
-        await asyncio.sleep(0.05)
-    await callback.message.answer(
-        t(
-            "admin.broadcast_result",
-            delivered=delivered,
-            failed=failed,
-            total=len(recipients),
-        )
-    )
 
 
 def _arguments(message: Message) -> list[str]:
@@ -1633,12 +2104,202 @@ async def admin_navigation(
     settings: Settings,
     state: FSMContext,
     prefs: PreferencesStore | None = None,
+    broadcasts: BroadcastStore | None = None,
+    wallet: WalletStore | None = None,
+    orders: OrderStore | None = None,
+    platega: PlategaClient | None = None,
 ) -> None:
     if not _admin_callback(callback, settings):
         await callback.answer(t("admin.command_unavailable"), show_alert=True)
         return
     action = (callback.data or "").removeprefix("admin:")
-    if action == "home":
+    if action == "payments" or action.startswith("payments:filter:"):
+        status = action.removeprefix("payments:filter:") if action != "payments" else "ALL"
+        if status not in {
+            "ALL", "PENDING", "CONFIRMED", "SUCCESS", "CANCELED",
+            "REFUNDING", "REFUNDED", "REVIEW",
+        }:
+            await callback.answer(t("admin.bad_button"), show_alert=True)
+            return
+        if wallet is None:
+            await callback.answer(t("admin.wallet_operation_failed"), show_alert=True)
+            return
+        try:
+            transactions = wallet.payment_transactions(
+                method="platega",
+                status=None if status == "ALL" else status,
+                limit=50,
+            )
+            text = _platega_payments_text(wallet, status)
+        except WalletError:
+            logger.warning("Platega admin report could not be loaded")
+            await callback.answer(t("admin.wallet_operation_failed"), show_alert=True)
+            return
+        await callback.answer()
+        await _edit(callback, text, platega_admin_keyboard(transactions, status))
+    elif action.startswith("payments:export:"):
+        status = action.removeprefix("payments:export:")
+        if status not in {
+            "ALL", "PENDING", "CONFIRMED", "SUCCESS", "CANCELED",
+            "REFUNDING", "REFUNDED", "REVIEW",
+        } or wallet is None or callback.message is None:
+            await callback.answer(t("admin.bad_button"), show_alert=True)
+            return
+        try:
+            rows = wallet.payment_transactions(
+                method="platega",
+                status=None if status == "ALL" else status,
+                limit=50_000,
+            )
+            content = _platega_transactions_csv(rows)
+        except WalletError:
+            logger.warning("Platega transaction export failed")
+            await callback.answer(t("admin.wallet_operation_failed"), show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.answer_document(
+            BufferedInputFile(content, filename="payments.csv")
+        )
+    elif action.startswith("payments:check:"):
+        payment_id = action.removeprefix("payments:check:")
+        if wallet is None or platega is None:
+            await callback.answer(t("admin.wallet_operation_failed"), show_alert=True)
+            return
+        try:
+            transaction = wallet.payment_transaction(payment_id)
+            if transaction is None or transaction.method != "platega":
+                await callback.answer(t("admin.wallet_payment_not_found"), show_alert=True)
+                return
+            local = (
+                wallet.topup(transaction.id)
+                if transaction.purpose == "topup"
+                else orders.get(transaction.id) if orders is not None else None
+            )
+            provider_id = local.provider_payment_id if local is not None else None
+            if not provider_id:
+                raise WalletError("Payment has no Platega transaction ID")
+            current = await platega.get_transaction_status(provider_id)
+            if (
+                current.payload != transaction.id
+                or current.currency != "RUB"
+                or current.amount * 100 != transaction.rub_amount_minor
+            ):
+                raise PlategaError("Platega status does not match local record")
+        except (WalletError, OrderError, PlategaError, ValueError):
+            logger.warning("Platega status lookup failed for admin")
+            await callback.answer(t("admin.wallet_operation_failed"), show_alert=True)
+            return
+        await callback.answer(
+            t("admin.platega_status", status=current.status), show_alert=True
+        )
+    elif action.startswith("payments:refund:"):
+        payment_id = action.removeprefix("payments:refund:")
+        if wallet is None or callback.message is None:
+            await callback.answer(t("admin.wallet_operation_failed"), show_alert=True)
+            return
+        try:
+            transaction = wallet.payment_transaction(payment_id)
+        except WalletError:
+            transaction = None
+        if (
+            transaction is None or transaction.method != "platega"
+            or transaction.status not in {"CONFIRMED", "SUCCESS"}
+        ):
+            await callback.answer(t("admin.platega_refund_unavailable"), show_alert=True)
+            return
+        refund_confirm_markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=t("common.confirm"),
+                        callback_data=f"admin:payments:refund-confirm:{transaction.id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=t("common.cancel"), callback_data="admin:payments"
+                    )
+                ],
+            ]
+        )
+        await callback.answer()
+        await _edit(
+            callback,
+            t(
+                "admin.platega_refund_confirm",
+                payment_id=escape(transaction.id),
+                amount=format_rubles(transaction.rub_amount_minor),
+            ),
+            refund_confirm_markup,
+        )
+    elif action.startswith("payments:refund-confirm:"):
+        payment_id = action.removeprefix("payments:refund-confirm:")
+        if wallet is None or orders is None or platega is None:
+            await callback.answer(t("admin.platega_refund_unavailable"), show_alert=True)
+            return
+        transaction = wallet.payment_transaction(payment_id)
+        if (
+            transaction is None or transaction.method != "platega"
+            or transaction.status not in {"CONFIRMED", "SUCCESS"}
+        ):
+            await callback.answer(t("admin.platega_refund_unavailable"), show_alert=True)
+            return
+        local = (
+            wallet.topup(transaction.id)
+            if transaction.purpose == "topup"
+            else orders.get(transaction.id)
+        )
+        provider_id = local.provider_payment_id
+        if not provider_id:
+            await callback.answer(t("admin.platega_refund_unavailable"), show_alert=True)
+            return
+        claimed = False
+        previous_status = local.status
+        try:
+            current = await platega.get_transaction_status(provider_id)
+            if (
+                current.status != "CONFIRMED"
+                or current.payload != transaction.id
+                or current.currency != "RUB"
+                or current.amount * 100 != transaction.rub_amount_minor
+            ):
+                raise PlategaError("Platega status does not match local payment")
+            if transaction.purpose == "topup":
+                claimed = wallet.claim_topup_refund(local.id)
+            else:
+                try:
+                    user = await panel.get_user_by_telegram_id(local.telegram_id)
+                except PanelNotFound:
+                    user = None
+                if user is not None and user.status == "ACTIVE":
+                    await callback.answer(t("plans.refund_active_user"), show_alert=True)
+                    return
+                claimed = orders.claim_refund(local.id)
+            if not claimed:
+                await callback.answer(t("admin.platega_refund_unavailable"), show_alert=True)
+                return
+            accepted = await platega.request_refund(provider_id)
+            if not accepted:
+                raise PlategaError("Platega requires manual refund handling")
+            wallet.update_provider_payment_status(provider_id, "REFUNDING")
+        except (WalletError, OrderError, PlategaError, PanelError, ValueError):
+            if claimed:
+                if transaction.purpose == "topup":
+                    wallet.release_topup_refund(local.id)
+                else:
+                    orders.release_refund(local.id, previous_status)
+            logger.warning("Platega refund request could not be completed")
+            await callback.answer(t("admin.platega_refund_unavailable"), show_alert=True)
+            return
+        await callback.answer(t("admin.platega_refund_requested"), show_alert=True)
+        await _edit(
+            callback,
+            t("admin.platega_refund_requested"),
+            platega_admin_keyboard(
+                wallet.payment_transactions(method="platega", limit=50), "ALL"
+            ),
+        )
+    elif action == "home":
         await state.clear()
         await callback.answer()
         await _edit(callback, _menu_text(), admin_keyboard())
@@ -1706,20 +2367,183 @@ async def admin_navigation(
             ),
             back_keyboard("admin:docs"),
         )
-    elif action == "broadcast":
+    elif action in {"broadcast", "broadcasts"}:
+        await state.clear()
+        await _broadcasts_screen(callback, broadcasts)
+    elif action == "bcast:new":
         await state.clear()
         await state.set_state(BroadcastFlow.message)
         await callback.answer()
-        await _edit(callback, t("admin.broadcast_prompt"), back_keyboard("admin:home"))
-    elif action == "broadcast:cancel":
+        await _edit(
+            callback,
+            t("admin.bcast_prompt"),
+            back_keyboard("admin:broadcasts"),
+        )
+    elif action.startswith("bcast:open:"):
         await state.clear()
-        await callback.answer()
-        await _edit(callback, t("admin.broadcast_cancelled"), admin_keyboard())
-    elif action == "broadcast:send":
-        if not _admin_callback(callback, settings):
-            await callback.answer(t("admin.command_unavailable"), show_alert=True)
+        try:
+            draft_id = int(action.rpartition(":")[2])
+            if draft_id <= 0:
+                raise ValueError
+        except ValueError:
+            await callback.answer(t("admin.bad_button"), show_alert=True)
             return
-        await _send_broadcast(callback, bot, settings, state, prefs)
+        await _broadcast_open(callback, broadcasts, draft_id)
+    elif action.startswith("bcast:text:"):
+        try:
+            draft_id = int(action.rpartition(":")[2])
+            if draft_id <= 0:
+                raise ValueError
+        except ValueError:
+            await callback.answer(t("admin.bad_button"), show_alert=True)
+            return
+        draft = _load_broadcast(broadcasts, draft_id)
+        if draft is None:
+            await callback.answer(t("admin.bcast_not_found"), show_alert=True)
+            return
+        await state.clear()
+        await state.update_data(broadcast_id=draft_id)
+        await state.set_state(BroadcastFlow.message)
+        await callback.answer()
+        await _edit(
+            callback,
+            t("admin.bcast_prompt_edit"),
+            back_keyboard(f"admin:bcast:open:{draft_id}"),
+        )
+    elif action.startswith("bcast:audience:"):
+        try:
+            draft_id = int(action.rpartition(":")[2])
+            if draft_id <= 0:
+                raise ValueError
+        except ValueError:
+            await callback.answer(t("admin.bad_button"), show_alert=True)
+            return
+        await _broadcast_audience_screen(callback, broadcasts, draft_id)
+    elif action.startswith("bcast:aud:"):
+        parts = action.split(":")
+        if len(parts) != 4:
+            await callback.answer(t("admin.stale_button"), show_alert=True)
+            return
+        try:
+            draft_id = int(parts[2])
+            if draft_id <= 0:
+                raise ValueError
+        except ValueError:
+            await callback.answer(t("admin.bad_button"), show_alert=True)
+            return
+        await _broadcast_set_audience(callback, broadcasts, draft_id, parts[3])
+    elif action.startswith("bcast:buttons:"):
+        try:
+            draft_id = int(action.rpartition(":")[2])
+            if draft_id <= 0:
+                raise ValueError
+        except ValueError:
+            await callback.answer(t("admin.bad_button"), show_alert=True)
+            return
+        await _broadcast_buttons_screen(callback, broadcasts, draft_id)
+    elif action.startswith("bcast:button:add:"):
+        try:
+            draft_id = int(action.rpartition(":")[2])
+            if draft_id <= 0:
+                raise ValueError
+        except ValueError:
+            await callback.answer(t("admin.bad_button"), show_alert=True)
+            return
+        draft = _load_broadcast(broadcasts, draft_id)
+        if draft is None:
+            await callback.answer(t("admin.bcast_not_found"), show_alert=True)
+            return
+        if len(draft.buttons) >= MAX_BUTTONS:
+            await callback.answer(t("admin.bcast_buttons_limit"), show_alert=True)
+            return
+        await state.clear()
+        await state.update_data(broadcast_id=draft_id)
+        await state.set_state(BroadcastFlow.button_label)
+        await callback.answer()
+        await _edit(
+            callback,
+            t("admin.bcast_button_label_prompt"),
+            back_keyboard(f"admin:bcast:buttons:{draft_id}"),
+        )
+    elif action.startswith("bcast:button:clear:"):
+        try:
+            draft_id = int(action.rpartition(":")[2])
+            if draft_id <= 0:
+                raise ValueError
+        except ValueError:
+            await callback.answer(t("admin.bad_button"), show_alert=True)
+            return
+        if broadcasts is None:
+            await callback.answer(t("admin.bcast_unavailable"), show_alert=True)
+            return
+        try:
+            broadcasts.set_buttons(draft_id, [])
+        except BroadcastError:
+            await callback.answer(t("admin.bcast_unavailable"), show_alert=True)
+            return
+        await callback.answer(t("admin.bcast_buttons_cleared"))
+        await _broadcast_buttons_screen(callback, broadcasts, draft_id)
+    elif action.startswith("bcast:test:"):
+        try:
+            draft_id = int(action.rpartition(":")[2])
+            if draft_id <= 0:
+                raise ValueError
+        except ValueError:
+            await callback.answer(t("admin.bad_button"), show_alert=True)
+            return
+        draft = _load_broadcast(broadcasts, draft_id)
+        if draft is None:
+            await callback.answer(t("admin.bcast_not_found"), show_alert=True)
+            return
+        sent = await _send_broadcast_preview(bot, callback.from_user.id, draft)
+        await callback.answer(
+            t("admin.bcast_test_sent") if sent else t("admin.bcast_test_failed"),
+            show_alert=not sent,
+        )
+    elif action.startswith("bcast:confirm:"):
+        try:
+            draft_id = int(action.rpartition(":")[2])
+            if draft_id <= 0:
+                raise ValueError
+        except ValueError:
+            await callback.answer(t("admin.bad_button"), show_alert=True)
+            return
+        await _broadcast_confirm(
+            callback, panel, settings, prefs, broadcasts, draft_id
+        )
+    elif action.startswith("bcast:launch:"):
+        try:
+            draft_id = int(action.rpartition(":")[2])
+            if draft_id <= 0:
+                raise ValueError
+        except ValueError:
+            await callback.answer(t("admin.bad_button"), show_alert=True)
+            return
+        await _broadcast_launch(
+            callback, bot, panel, settings, prefs, broadcasts, draft_id
+        )
+    elif action.startswith("bcast:delete:"):
+        try:
+            draft_id = int(action.rpartition(":")[2])
+            if draft_id <= 0:
+                raise ValueError
+        except ValueError:
+            await callback.answer(t("admin.bad_button"), show_alert=True)
+            return
+        if broadcasts is None:
+            await callback.answer(t("admin.bcast_unavailable"), show_alert=True)
+            return
+        draft = _load_broadcast(broadcasts, draft_id)
+        if draft is not None and draft.status in {SENT, SENDING}:
+            await callback.answer(t("admin.bcast_already_sent"), show_alert=True)
+            return
+        try:
+            broadcasts.delete(draft_id)
+        except BroadcastError:
+            await callback.answer(t("admin.bcast_unavailable"), show_alert=True)
+            return
+        await callback.answer(t("admin.bcast_deleted"))
+        await _broadcasts_screen(callback, broadcasts)
     elif action == "logs":
         await state.clear()
         await callback.answer()

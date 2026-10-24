@@ -32,6 +32,19 @@ class Settings:
     ticket_portal_url: str | None = None
     state_db_path: str | None = None
     owner_telegram_id: int | None = None
+    platega_merchant_id: str | None = None
+    platega_secret: str | None = None
+
+    @property
+    def platega_enabled(self) -> bool:
+        return bool(self.platega_merchant_id and self.platega_secret)
+
+    @property
+    def platega_callback_url(self) -> str | None:
+        if not self.platega_enabled or self.ticket_portal_url is None:
+            return None
+        parsed = urlsplit(self.ticket_portal_url)
+        return f"{parsed.scheme}://{parsed.netloc}/platega/callback"
 
     @property
     def trial_channel_url(self) -> str:
@@ -210,6 +223,26 @@ class Settings:
                     "TICKET_PORTAL_URL must be an HTTPS /support URL"
                 )
 
+        merchant_id = os.environ.get("PLATEGA_MERCHANT_ID", "").strip() or None
+        platega_secret = os.environ.get("PLATEGA_SECRET", "").strip() or None
+        if bool(merchant_id) != bool(platega_secret):
+            raise ConfigurationError("Set both PLATEGA_MERCHANT_ID and PLATEGA_SECRET")
+        if merchant_id is not None:
+            try:
+                merchant_id = str(UUID(merchant_id))
+            except ValueError as error:
+                raise ConfigurationError("PLATEGA_MERCHANT_ID must be a UUID") from error
+            if (
+                not platega_secret or not platega_secret.isascii()
+                or len(platega_secret) > 4096
+                or any(ord(char) < 33 or ord(char) == 127 for char in platega_secret)
+            ):
+                raise ConfigurationError("PLATEGA_SECRET must be a valid API key")
+            if ticket_portal_url is None:
+                raise ConfigurationError(
+                    "TICKET_PORTAL_URL is required for Platega callbacks"
+                )
+
         return cls(
             bot_token=bot_token,
             panel_api_url=panel_api_url,
@@ -227,4 +260,6 @@ class Settings:
             ticket_portal_url=ticket_portal_url,
             state_db_path=state_db_path,
             owner_telegram_id=owner_id,
+            platega_merchant_id=merchant_id,
+            platega_secret=platega_secret,
         )

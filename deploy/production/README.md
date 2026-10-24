@@ -111,6 +111,16 @@ Run from `/opt/jopesvpn/deploy/production`. The `.env` file is required explicit
 
    Admin panel `📡 Логи подключений` toggles connection alerts in the admins' private chats. State is stored in SQLite and shared by all `BOT_ADMIN_IDS`. When enabled, a background task baselines `known_users()` silently, then polls every 60 seconds via `GET /api/users/by-username/{username}` and `GET /api/hwid/devices/{userId}`. New `(hwid, requestIp)` endpoints (or endpoints older than 24 hours) and changed `userTraffic.onlineAt` (30-minute cooldown) produce a message with Telegram account, Panel ID, tariff, status, expiry, platform/OS/model, `userAgent`, HWID, IP, Node UUID, and time. Buttons open the profile, Subscription Page, device list, disable/enable confirmation, and log toggle. IP/client come from HWID subscription-request metadata, not packet-level VPN sessions. Coverage is limited to users who have started the bot because the current token lacks global connection-job scopes (`403`); delivery is best-effort. Do not copy IP/HWID values from these alerts into logs or public reports.
 
+## Platega.io payments
+
+Telegram Stars remains available for plan purchases and wallet top-ups. When both `PLATEGA_MERCHANT_ID` and `PLATEGA_SECRET` are configured, the plan and top-up screens additionally offer the documented one-off methods (SBP QR, ERIP, card, international, crypto, SberPay) without provider branding. The wallet minimum is 1 RUB, verified by creating an unpaid SBP invoice against the configured merchant. Top-up buttons contain their quoted amount and remain usable after navigation or a bot restart. Pending invoices are reused only for the same payment method and before their saved expiry.
+
+Set the callback URL in Platega's merchant settings to `https://<CONNECT_DOMAIN>/platega/callback`. Caddy forwards it to the bot over the private Compose network; reload Caddy after adding the route. The public probe is `https://<CONNECT_DOMAIN>/platega/healthz`. Authenticated callbacks are durably queued in SQLite and acknowledged immediately. A background worker checks the authenticated transaction-status API, verifies the payment ID, amount, currency and any supplied payload, then credits or fulfills once. Callback payload is optional, as documented. A missing or delayed callback is recovered by automatic polling every 10 seconds for recent invoices, with slower checks for older invoices and backoff after API errors. Users receive confirmation automatically, and the payment message is updated; manual checking is not part of the new payment keyboard.
+
+Payment checks and the notification outbox survive restarts in the shared SQLite volume. Telegram delivery errors retry independently of financial processing. Interrupted orders already marked paid can resume fulfillment; interrupted or uncertain Panel mutations go to the existing review workflow to avoid a duplicate extension. Admins can filter online transactions by status, check provider status, export a CSV, and confirm a refund request. The refund ledger waits for `CHARGEBACKED` verified through the API; callbacks and automatic polling both reconcile refunds. Repeated or out-of-order notifications cannot re-credit a refunded payment.
+
+This product currently sells prepaid terms; it does not silently enable automatic recurring renewals. Platega recurring subscriptions need separate opt-in, renewal/cancellation policy, and subscription-charge reconciliation. Payout API calls also require a dedicated payout secret and idempotency-key persistence; do not substitute `PLATEGA_SECRET` or enable payouts without those credentials and an explicitly approved payout workflow. No real Platega payment or refund was used for verification.
+
 ## Subscription Page
 
 `remnawave-subscription-page` is a separate container (`remnawave/subscription-page:8.0.0`, digest pinned in Compose) on the `backend` network with no published port. Caddy serves it at the root of `connect.example.com`, so the page URL is `https://connect.example.com/<short_uuid>`. It cannot live under a path because its frontend assets are requested from `/assets`. The page host must be a host root; do not attach it to the Panel SPA host or share a path with it.
@@ -228,7 +238,7 @@ docker compose --env-file .env -f docker-compose.yml --profile bot logs --tail=1
   docker exec jopesvpn-production-bot python -m jopesvpn.bot --check-telegram
   ```
 
-  SQLite migrations are additive: they add navigation/order metadata, support ticket tables/columns, and the wallet payment/bonus audit tables without deleting Panel accounts or VPN data. Bot startup backfills confirmed Stars top-ups, paid subscription orders, and settled withdrawals into the payment history. Admins use **Balances and bonuses** to make reason-required balance adjustments, configure a fixed-ruble or percentage bonus for future confirmed top-ups, and search payment records by ID. Only Telegram Stars is configured as an external payment method; do not advertise or credit other methods until a real provider and verified callback are implemented. Do not restore the old SQLite file after users/payments/tickets may have changed; rollback the application image while preserving the migrated database. If rollback is needed in the same shell, retag both saved pre-update images:
+  SQLite migrations are additive: they add navigation/order metadata, support ticket tables/columns, wallet payment/bonus audit tables, payment-method/expiry columns, `platega_checks`, and `payment_outbox` without deleting Panel accounts or VPN data. Bot startup backfills confirmed Stars top-ups, paid subscription orders, and settled withdrawals into payment history. Admins use **Balances and bonuses** for reason-required balance adjustments, bonus configuration, and payment lookup; **Online payments** adds status filters, provider status checks, CSV export, and confirmed refund requests. Make a protected SQLite backup before rollout, then preserve the migrated database during application rollback. If rollback is needed in the same shell, retag both saved pre-update images:
 
   ```bash
   docker compose --env-file .env -f docker-compose.yml --profile bot stop bot ticket-forum
@@ -275,6 +285,28 @@ docker compose --env-file .env -f docker-compose.yml --profile bot logs --tail=1
 - All Compose services use the `json-file` log driver with `max-size: 10m` and `max-file: 3`.
 - For reboot recovery, Docker's `unless-stopped` policy restarts the services and their named volumes persist. Verify `docker compose ps`, Panel health, Node status, certificate, and the external VPN check after reboot.
 - Never use `docker compose down -v` in routine updates or troubleshooting; it removes persistent state.
+
+## Off-host bot-state backup
+
+Run `offhost-backup.ps1` from a trusted Windows workstation with the existing `jopesvpn` SSH alias and OpenSSL available. The script takes a consistent SQLite online backup from the running bot container, streams it over SSH, encrypts it locally with AES-256-CBC/PBKDF2, authenticates the ciphertext with HMAC-SHA256, decrypts to a temporary file, and verifies `PRAGMA integrity_check` before retaining it. Encrypted snapshots and a DPAPI-protected key are stored under `%USERPROFILE%\JopesVPN-Backups`; plaintext temporary files are removed. The key is tied to the Windows user profile and must be included in that workstation's own protected backup to preserve recoverability.
+
+Run once and register a daily task in the current Windows user's interactive session:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\offhost-backup.ps1
+$action = New-ScheduledTaskAction -Execute "$PSHOME\powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$((Resolve-Path .\offhost-backup.ps1).Path)`""
+$trigger = New-ScheduledTaskTrigger -Daily -At 3am
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+Register-ScheduledTask -TaskName JopesVPN-OffhostBackup -Action $action -Trigger $trigger -Settings $settings -Force
+```
+
+The workstation must be online and the user logged in for scheduled runs; review `%USERPROFILE%\JopesVPN-Backups\backup.log` and the Task Scheduler result. Restore only to a new local path for verification; the script refuses to overwrite an existing path:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\offhost-backup.ps1 -RestoreFile "$env:USERPROFILE\JopesVPN-Backups\bot-state-<timestamp>.sqlite3.enc" -RestoreTo "$env:TEMP\jopesvpn-restore\bot-state.sqlite3"
+```
+
+This off-host job covers the bot SQLite database (billing, referrals, tickets, and bot state), not Panel PostgreSQL or Caddy certificate/account data. Keep those protected backups on a separate schedule and test their restore independently.
 
 ## Validated vs pending
 

@@ -153,6 +153,8 @@ services:
     image: jopesvpn-bot:1.0.0
     container_name: jopesvpn-production-bot
     restart: unless-stopped
+    expose:
+      - "8081"
     logging: *default-logging
     init: true
     stop_grace_period: 30s
@@ -178,6 +180,8 @@ services:
       ENABLE_FREE_ACCESS: ${ENABLE_FREE_ACCESS:-0}
       SUBSCRIPTION_PAGE_URL: ${SUBSCRIPTION_PAGE_URL:-https://connect.example.com}
       TICKET_PORTAL_URL: ${TICKET_PORTAL_URL:-https://connect.example.com/support}
+      PLATEGA_MERCHANT_ID: ${PLATEGA_MERCHANT_ID:-}
+      PLATEGA_SECRET: ${PLATEGA_SECRET:-}
       BOT_STATE_DB: /app/data/bot-state.sqlite3
     volumes:
       # Owner-editable tariffs; restart the bot after editing, no rebuild needed.

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import tempfile
 import sqlite3
+import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
 
 from jopesvpn.ticket_ui import ticket_detail_text, ticket_list_keyboard
-from jopesvpn.tickets import TicketStore
+from jopesvpn.tickets import TicketRateLimited, TicketStore
 
 
 class TicketStoreTests(unittest.TestCase):
@@ -138,6 +138,25 @@ class TicketStoreTests(unittest.TestCase):
             ],
             [first],
         )
+
+    def test_ticket_creation_is_rate_limited_atomically(self) -> None:
+        for index in range(3):
+            self.store.create(101, "Tester", "other", f"Message {index}")
+        with self.assertRaises(TicketRateLimited) as error:
+            self.store.create(101, "Tester", "other", "Too soon")
+        self.assertEqual(error.exception.retry_after_seconds, 86_400)
+        self.assertEqual(self.store.user_ticket_count(101), 3)
+
+    def test_user_replies_are_rate_limited_but_admin_replies_are_not(self) -> None:
+        ticket_id = self.store.create(101, "Tester", "other", "Initial")
+        for index in range(10):
+            self.store.add_message(ticket_id, 900, "admin", f"Admin {index}")
+        for index in range(10):
+            self.store.add_message(ticket_id, 101, "user", f"Reply {index}")
+        with self.assertRaises(TicketRateLimited) as error:
+            self.store.add_message(ticket_id, 101, "user", "Too soon")
+        self.assertGreater(error.exception.retry_after_seconds, 0)
+        self.assertLessEqual(error.exception.retry_after_seconds, 3_600)
 
 
 class TicketScreenTests(unittest.TestCase):

@@ -28,6 +28,7 @@ from jopesvpn.bot import (
     admin_navigation,
     admin_revoke,
     connect_command,
+    ping_command,
     router,
     trial_check,
 )
@@ -1193,6 +1194,36 @@ class RemnawaveClientTests(unittest.IsolatedAsyncioTestCase):
                 await client.enable_user(user)
         finally:
             await client.close()
+
+
+class PingCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ping_reports_build_api_latency_and_uptime(self) -> None:
+        from unittest.mock import patch
+
+        answers: list[str] = []
+
+        class Bot:
+            async def get_me(self):
+                return object()
+
+        class Message:
+            async def answer(self, text: str) -> None:
+                answers.append(text)
+
+        with (
+            patch("jopesvpn.bot.PROCESS_STARTED_AT", 10.0),
+            patch("jopesvpn.bot.time.monotonic", return_value=93_794.0),
+            patch(
+                "jopesvpn.bot.time.perf_counter",
+                side_effect=(100.0, 100.042),
+            ),
+        ):
+            await ping_command(Message(), Bot())
+
+        self.assertEqual(len(answers), 1)
+        self.assertIn("Сборка: JV-PAYMENTS-R6", answers[0])
+        self.assertIn("Telegram API: 42 мс", answers[0])
+        self.assertIn("Uptime: 1д 02:03:04", answers[0])
 
 
 class BotAuthorizationTests(unittest.IsolatedAsyncioTestCase):

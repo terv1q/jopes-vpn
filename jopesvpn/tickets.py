@@ -14,6 +14,12 @@ class TicketStoreError(Exception):
     pass
 
 
+class TicketRateLimited(TicketStoreError):
+    def __init__(self, retry_after_seconds: int) -> None:
+        super().__init__("Support ticket rate limit exceeded")
+        self.retry_after_seconds = retry_after_seconds
+
+
 class TicketStore:
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
@@ -71,15 +77,25 @@ class TicketStore:
                         attempted_at TEXT,
                         delivered_at TEXT
                     );
+                    CREATE TABLE IF NOT EXISTS support_ticket_rate_limits (
+                        user_id INTEGER NOT NULL,
+                        action TEXT NOT NULL,
+                        window_started_at INTEGER NOT NULL,
+                        request_count INTEGER NOT NULL,
+                        PRIMARY KEY (user_id, action)
+                    );
                     CREATE INDEX IF NOT EXISTS support_ticket_notifications_pending
                         ON support_ticket_notifications(delivered_at, attempted_at);
                     CREATE TABLE IF NOT EXISTS channel_posts (
                         post_id INTEGER PRIMARY KEY AUTOINCREMENT,
                         owner_id INTEGER NOT NULL,
+                        reviewer_id INTEGER NOT NULL DEFAULT 0,
                         body_html TEXT NOT NULL,
                         buttons_json TEXT NOT NULL,
                         photo_data BLOB,
                         photo_mime TEXT,
+                        photo_file_id TEXT,
+                        post_type TEXT NOT NULL DEFAULT 'standard',
                         status TEXT NOT NULL DEFAULT 'queued'
                             CHECK(status IN (
                                 'queued', 'preview_sending', 'awaiting_approval',
@@ -130,6 +146,21 @@ class TicketStore:
                     connection.execute(
                         "ALTER TABLE support_ticket_messages ADD COLUMN source_ip TEXT"
                     )
+                post_columns = {
+                    row["name"]
+                    for row in connection.execute(
+                        "PRAGMA table_info(channel_posts)"
+                    ).fetchall()
+                }
+                for column, definition in (
+                    ("reviewer_id", "INTEGER NOT NULL DEFAULT 0"),
+                    ("photo_file_id", "TEXT"),
+                    ("post_type", "TEXT NOT NULL DEFAULT 'standard'"),
+                ):
+                    if column not in post_columns:
+                        connection.execute(
+                            f"ALTER TABLE channel_posts ADD COLUMN {column} {definition}"
+                        )
                 connection.execute("PRAGMA journal_mode = WAL")
                 connection.commit()
         except (OSError, sqlite3.Error) as error:
@@ -151,6 +182,51 @@ class TicketStore:
             raise ValueError("Ticket message cannot be empty")
         return message
 
+    @staticmethod
+    def _consume_rate_limit_locked(
+        connection: sqlite3.Connection,
+        user_id: int,
+        action: str,
+        *,
+        limit: int,
+        window_seconds: int,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT window_started_at, request_count
+            FROM support_ticket_rate_limits
+            WHERE user_id = ? AND action = ?
+            """,
+            (user_id, action),
+        ).fetchone()
+        now = int(connection.execute("SELECT unixepoch()").fetchone()[0])
+        if row is None or now - int(row["window_started_at"]) >= window_seconds:
+            connection.execute(
+                """
+                INSERT INTO support_ticket_rate_limits
+                    (user_id, action, window_started_at, request_count)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(user_id, action) DO UPDATE SET
+                    window_started_at = excluded.window_started_at,
+                    request_count = 1
+                """,
+                (user_id, action, now),
+            )
+            return
+        count = int(row["request_count"])
+        if count >= limit:
+            raise TicketRateLimited(
+                max(1, window_seconds - (now - int(row["window_started_at"])))
+            )
+        connection.execute(
+            """
+            UPDATE support_ticket_rate_limits
+            SET request_count = request_count + 1
+            WHERE user_id = ? AND action = ?
+            """,
+            (user_id, action),
+        )
+
     def create(
         self,
         user_id: int,
@@ -165,6 +241,13 @@ class TicketStore:
         try:
             with closing(self._connect()) as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                self._consume_rate_limit_locked(
+                    connection,
+                    user_id,
+                    "create",
+                    limit=3,
+                    window_seconds=86_400,
+                )
                 cursor = connection.execute(
                     """
                     INSERT INTO support_tickets (user_id, user_name, category)
@@ -219,6 +302,14 @@ class TicketStore:
                 if ticket is None or ticket["status"] != "open":
                     connection.rollback()
                     return False
+                if sender_role == "user":
+                    self._consume_rate_limit_locked(
+                        connection,
+                        sender_id,
+                        "reply",
+                        limit=10,
+                        window_seconds=3_600,
+                    )
                 connection.execute(
                     """
                     INSERT INTO support_ticket_messages
@@ -422,6 +513,55 @@ class TicketStore:
                 return changed == 1
         except sqlite3.Error as error:
             raise TicketStoreError("Cannot close support ticket") from error
+
+    def update_channel_post_preview_photo(
+        self,
+        post_id: int,
+        reviewer_id: int,
+        photo_file_id: str,
+        preview_message_id: int,
+    ) -> int | None:
+        if (
+            post_id <= 0
+            or reviewer_id <= 0
+            or not photo_file_id
+            or len(photo_file_id) > 1024
+            or preview_message_id <= 0
+        ):
+            raise ValueError("Invalid channel post image")
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT preview_message_id
+                    FROM channel_posts
+                    WHERE post_id = ?
+                      AND COALESCE(NULLIF(reviewer_id, 0), owner_id) = ?
+                      AND status = 'awaiting_approval'
+                    """,
+                    (post_id, reviewer_id),
+                ).fetchone()
+                if row is None:
+                    connection.rollback()
+                    return None
+                connection.execute(
+                    """
+                    UPDATE channel_posts
+                    SET photo_file_id = ?, photo_data = NULL, photo_mime = NULL,
+                        preview_message_id = ?, updated_at = datetime('now')
+                    WHERE post_id = ? AND status = 'awaiting_approval'
+                    """,
+                    (photo_file_id, preview_message_id, post_id),
+                )
+                connection.commit()
+                return (
+                    None
+                    if row["preview_message_id"] is None
+                    else int(row["preview_message_id"])
+                )
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot update channel post image") from error
 
     def rate(self, ticket_id: int, user_id: int, rating: int) -> bool:
         if ticket_id <= 0 or user_id <= 0 or not 1 <= rating <= 5:
@@ -693,10 +833,23 @@ class TicketStore:
         buttons: list[list[dict[str, str]]],
         photo_data: bytes | None,
         photo_mime: str | None,
+        *,
+        reviewer_id: int | None = None,
+        photo_file_id: str | None = None,
+        post_type: str = "standard",
     ) -> int:
-        if owner_id <= 0 or (not body_html and photo_data is None):
+        if (
+            owner_id <= 0
+            or (reviewer_id is not None and reviewer_id <= 0)
+            or (not body_html and photo_data is None and photo_file_id is None)
+            or post_type not in {"standard", "promo"}
+        ):
             raise ValueError("Invalid channel post")
-        if len(body_html) > 1024 or (photo_data is not None and len(photo_data) > 10_000_000):
+        if (
+            len(body_html) > 1024
+            or (photo_data is not None and len(photo_data) > 10_000_000)
+            or (photo_file_id is not None and len(photo_file_id) > 1024)
+        ):
             raise ValueError("Channel post is too large")
         try:
             buttons_json = json.dumps(buttons, ensure_ascii=True, separators=(",", ":"))
@@ -704,10 +857,20 @@ class TicketStore:
                 cursor = connection.execute(
                     """
                     INSERT INTO channel_posts
-                        (owner_id, body_html, buttons_json, photo_data, photo_mime)
-                    VALUES (?, ?, ?, ?, ?)
+                        (owner_id, reviewer_id, body_html, buttons_json, photo_data,
+                         photo_mime, photo_file_id, post_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (owner_id, body_html, buttons_json, photo_data, photo_mime),
+                    (
+                        owner_id,
+                        reviewer_id or 0,
+                        body_html,
+                        buttons_json,
+                        photo_data,
+                        photo_mime,
+                        photo_file_id,
+                        post_type,
+                    ),
                 )
                 connection.commit()
                 if cursor.lastrowid is None:
@@ -724,7 +887,8 @@ class TicketStore:
                 rows = connection.execute(
                     """
                     SELECT post_id, body_html, status, created_at, updated_at,
-                           photo_data IS NOT NULL AS has_photo
+                           (photo_data IS NOT NULL OR photo_file_id IS NOT NULL)
+                               AS has_photo
                     FROM channel_posts ORDER BY post_id DESC LIMIT ?
                     """,
                     (limit,),
@@ -829,7 +993,8 @@ class TicketStore:
                     """
                     UPDATE channel_posts
                     SET status = 'publishing', updated_at = datetime('now')
-                    WHERE post_id = ? AND owner_id = ?
+                    WHERE post_id = ?
+                      AND COALESCE(NULLIF(reviewer_id, 0), owner_id) = ?
                       AND status = 'awaiting_approval'
                     """,
                     (post_id, owner_id),
@@ -881,7 +1046,8 @@ class TicketStore:
                     """
                     UPDATE channel_posts
                     SET status = 'cancelled', updated_at = datetime('now')
-                    WHERE post_id = ? AND owner_id = ?
+                    WHERE post_id = ?
+                      AND COALESCE(NULLIF(reviewer_id, 0), owner_id) = ?
                       AND status = 'awaiting_approval'
                     """,
                     (post_id, owner_id),
@@ -889,6 +1055,23 @@ class TicketStore:
                 connection.commit()
         except sqlite3.Error as error:
             raise TicketStoreError("Cannot cancel channel post") from error
+        return changed == 1
+
+    def cancel_queued_promo_post(self, post_id: int, owner_id: int) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                changed = connection.execute(
+                    """
+                    UPDATE channel_posts
+                    SET status = 'cancelled', updated_at = datetime('now')
+                    WHERE post_id = ? AND owner_id = ? AND post_type = 'promo'
+                      AND status = 'queued'
+                    """,
+                    (post_id, owner_id),
+                ).rowcount
+                connection.commit()
+        except sqlite3.Error as error:
+            raise TicketStoreError("Cannot cancel incomplete promo post") from error
         return changed == 1
 
     def record_channel_post_click(

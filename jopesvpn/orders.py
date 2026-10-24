@@ -50,12 +50,15 @@ class Order:
     status: str
     provider: str | None
     provider_payment_id: str | None
+    provider_payment_url: str | None
     created_at: str
     paid_at: str | None
     fulfilled_at: str | None
     term_days: int | None = None
     rub_price_minor: int | None = None
     discount_rub_minor: int | None = None
+    provider_payment_method: int | None = None
+    provider_expires_at: str | None = None
 
 
 def _now() -> str:
@@ -72,12 +75,15 @@ def _order(row: sqlite3.Row) -> Order:
         status=row["status"],
         provider=row["provider"],
         provider_payment_id=row["provider_payment_id"],
+        provider_payment_url=row["provider_payment_url"],
         created_at=row["created_at"],
         paid_at=row["paid_at"],
         fulfilled_at=row["fulfilled_at"],
         term_days=row["term_days"],
         rub_price_minor=row["rub_price_minor"],
         discount_rub_minor=row["discount_rub_minor"],
+        provider_payment_method=row["provider_payment_method"],
+        provider_expires_at=row["provider_expires_at"],
     )
 
 
@@ -104,6 +110,7 @@ class OrderStore:
                     status TEXT NOT NULL,
                     provider TEXT,
                     provider_payment_id TEXT,
+                    provider_payment_url TEXT,
                     created_at TEXT NOT NULL,
                     paid_at TEXT,
                     fulfilled_at TEXT,
@@ -121,10 +128,17 @@ class OrderStore:
             }
             if "admin_notified_at" not in columns:
                 connection.execute("ALTER TABLE orders ADD COLUMN admin_notified_at TEXT")
+            if "provider_payment_url" not in columns:
+                connection.execute(
+                    "ALTER TABLE orders ADD COLUMN provider_payment_url TEXT"
+                )
             for column, declaration in (
                 ("term_days", "INTEGER"),
                 ("rub_price_minor", "INTEGER"),
                 ("discount_rub_minor", "INTEGER"),
+                ("recovery_retry_used", "INTEGER NOT NULL DEFAULT 0"),
+                ("provider_payment_method", "INTEGER"),
+                ("provider_expires_at", "TEXT"),
             ):
                 if column not in columns:
                     connection.execute(
@@ -151,24 +165,36 @@ class OrderStore:
         term: PlanTerm | None = None,
         *,
         now: str | None = None,
+        provider: str | None = None,
+        payment_method: int | None = None,
     ) -> Order:
         if telegram_id <= 0:
             raise ValueError("Telegram ID must be positive")
+        if provider not in {None, "platega"}:
+            raise ValueError("External payment requires a priced plan term")
+        if provider == "platega" and term is None:
+            raise ValueError("External payment requires a priced plan term")
         if term is not None and plan.term_for(term.days) != term:
             raise ValueError("Selected term is not part of the plan")
         stars_amount = plan.price_minor if term is None else term.stars_amount
         if stars_amount is None:
             raise PlanPriceMissing(f"Plan {plan.code} has no price")
         term_days = plan.days if term is None else term.days
+        amount_minor = (
+            term.price_rub_minor
+            if provider == "platega" and term is not None
+            else stars_amount
+        )
         order = Order(
             id=uuid.uuid4().hex,
             telegram_id=telegram_id,
             plan_code=plan.code,
-            amount_minor=stars_amount,
-            currency=plan.currency,
+            amount_minor=amount_minor,
+            currency="RUB" if provider == "platega" else plan.currency,
             status=PENDING,
-            provider=None,
+            provider=provider,
             provider_payment_id=None,
+            provider_payment_url=None,
             created_at=now or _now(),
             paid_at=None,
             fulfilled_at=None,
@@ -177,6 +203,7 @@ class OrderStore:
             discount_rub_minor=(
                 None if term is None else term_savings(plan, term)[0]
             ),
+            provider_payment_method=payment_method,
         )
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -184,6 +211,7 @@ class OrderStore:
                 """
                 UPDATE orders SET status = ?
                 WHERE telegram_id = ? AND status = ?
+                  AND (provider IS NULL OR provider != 'platega')
                   AND datetime(created_at) <= datetime(?, '-30 minutes')
                 """,
                 (CANCELLED, telegram_id, PENDING, order.created_at),
@@ -193,10 +221,17 @@ class OrderStore:
                 SELECT * FROM orders
                 WHERE telegram_id = ? AND plan_code = ? AND status = ?
                   AND term_days IS ?
+                  AND provider IS ? AND currency = ?
+                  AND provider_payment_method IS ?
+                  AND (provider_expires_at IS NULL OR datetime(provider_expires_at) > datetime(?))
+                  AND (provider != 'platega' OR provider_payment_id IS NULL OR provider_payment_url IS NOT NULL)
                   AND datetime(created_at) > datetime(?, '-30 minutes')
                 ORDER BY created_at DESC LIMIT 1
                 """,
-                (telegram_id, plan.code, PENDING, term_days, order.created_at),
+                (
+                    telegram_id, plan.code, PENDING, term_days, provider,
+                    order.currency, payment_method, order.created_at, order.created_at,
+                ),
             ).fetchone()
             if existing is not None:
                 existing_order = _order(existing)
@@ -219,8 +254,8 @@ class OrderStore:
                     id, telegram_id, plan_code, amount_minor, currency,
                     status, provider, provider_payment_id, created_at,
                     paid_at, fulfilled_at, term_days, rub_price_minor,
-                    discount_rub_minor
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    discount_rub_minor, provider_payment_method
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order.id,
@@ -237,6 +272,7 @@ class OrderStore:
                     order.term_days,
                     order.rub_price_minor,
                     order.discount_rub_minor,
+                    payment_method,
                 ),
             )
             connection.commit()
@@ -247,6 +283,42 @@ class OrderStore:
             row = connection.execute(
                 "SELECT * FROM orders WHERE id = ?", (order_id,)
             ).fetchone()
+        if row is None:
+            raise OrderNotFound(order_id)
+        return _order(row)
+
+    def save_payment_link(
+        self, order_id: str, payment_id: str, payment_url: str | None = None,
+        *, expires_at: str | None = None,
+    ) -> Order:
+        if not payment_id or (payment_url is not None and not payment_url):
+            raise ValueError("Payment ID and URL are required")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """
+                UPDATE orders SET provider_payment_id = ?, provider_payment_url = ?, provider_expires_at = ?
+                WHERE id = ? AND provider = 'platega' AND status = ?
+                  AND provider_payment_id IS NULL
+                """,
+                (payment_id, payment_url, expires_at, order_id, PENDING),
+            ).rowcount
+            if changed != 1:
+                row = connection.execute(
+                    "SELECT * FROM orders WHERE id = ?", (order_id,)
+                ).fetchone()
+                if (
+                    row is None
+                    or row["provider"] != "platega"
+                    or row["status"] != PENDING
+                    or row["provider_payment_id"] != payment_id
+                    or row["provider_payment_url"] != payment_url
+                ):
+                    raise OrderConflict("Payment link cannot be saved")
+            row = connection.execute(
+                "SELECT * FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            connection.commit()
         if row is None:
             raise OrderNotFound(order_id)
         return _order(row)
@@ -263,6 +335,24 @@ class OrderStore:
                 (telegram_id,),
             ).fetchone()
         return None if row is None else _order(row)
+
+    def user_has_subscription_purchase(self, telegram_id: int) -> bool:
+        if telegram_id <= 0:
+            raise ValueError("Telegram ID must be positive")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM orders
+                WHERE telegram_id = ?
+                  AND status IN (
+                      'FULFILLED', 'REFUNDED', 'REFUNDING',
+                      'FULFILLMENT_REVIEW'
+                  )
+                LIMIT 1
+                """,
+                (telegram_id,),
+            ).fetchone()
+        return row is not None
 
     def pending_review_notifications(self, limit: int = 25) -> list[Order]:
         if limit < 1:
@@ -326,9 +416,16 @@ class OrderStore:
                     )
                 ):
                     return order, False
-                raise OrderConflict("Order already has another payment")
-            if order.status != PENDING:
+                if (
+                    order.provider != provider
+                    or order.provider_payment_id != provider_payment_id
+                    or (order.status != PENDING and not (provider == "platega" and order.status == CANCELLED))
+                ):
+                    raise OrderConflict("Order already has another payment")
+            if order.status != PENDING and not (provider == "platega" and order.status == CANCELLED):
                 raise OrderStateError(f"Order is {order.status}")
+            if order.provider is not None and order.provider != provider:
+                raise OrderConflict("Payment provider does not match the order")
             if amount_minor != order.amount_minor or currency.upper() != order.currency:
                 raise OrderConflict("Payment amount or currency does not match the order")
             paid_at = now or _now()
@@ -345,7 +442,7 @@ class OrderStore:
                         provider_payment_id,
                         paid_at,
                         order.id,
-                        PENDING,
+                        order.status,
                     ),
                 )
             except sqlite3.IntegrityError as error:
@@ -377,7 +474,13 @@ class OrderStore:
             connection.commit()
         return True
 
-    def mark_fulfilled(self, order_id: str, *, now: str | None = None) -> bool:
+    def mark_fulfilled(
+        self,
+        order_id: str,
+        *,
+        now: str | None = None,
+        payment_completer: Callable[[sqlite3.Connection, str], None] | None = None,
+    ) -> bool:
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -390,13 +493,18 @@ class OrderStore:
                 return False
             if order.status != FULFILLING:
                 raise OrderStateError(f"Order is {order.status}")
-            connection.execute(
+            changed = connection.execute(
                 """
                 UPDATE orders SET status = ?, fulfilled_at = ?
                 WHERE id = ? AND status = ?
                 """,
                 (FULFILLED, now or _now(), order.id, FULFILLING),
-            )
+            ).rowcount
+            if changed != 1:
+                connection.rollback()
+                return False
+            if payment_completer is not None:
+                payment_completer(connection, order.id)
             connection.commit()
         return True
 
@@ -406,22 +514,37 @@ class OrderStore:
             changed = connection.execute(
                 """
                 UPDATE orders SET status = ?
-                WHERE id = ? AND status = ?
+                WHERE id = ? AND status IN (?, ?)
                 """,
-                (FULFILLMENT_REVIEW, order_id, FULFILLING),
+                (FULFILLMENT_REVIEW, order_id, FULFILLING, PAID),
             ).rowcount
             connection.commit()
         if changed != 1:
             raise OrderStateError("Order is not awaiting fulfillment")
 
-    def get_by_payment_id(self, payment_id: str) -> Order | None:
+    def claim_recovery_retry(self, order_id: str) -> bool:
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """
+                UPDATE orders
+                SET status = ?, recovery_retry_used = 1
+                WHERE id = ? AND status = ? AND recovery_retry_used = 0
+                """,
+                (FULFILLING, order_id, FULFILLMENT_REVIEW),
+            ).rowcount
+            connection.commit()
+        return changed == 1
+
+    def get_by_payment_id(
+        self, payment_id: str, *, provider: str = "telegram_stars"
+    ) -> Order | None:
+        if provider not in {"telegram_stars", "platega"}:
+            raise ValueError("Unsupported payment provider")
         with closing(self._connect()) as connection:
             row = connection.execute(
-                """
-                SELECT * FROM orders
-                WHERE provider = 'telegram_stars' AND provider_payment_id = ?
-                """,
-                (payment_id,),
+                "SELECT * FROM orders WHERE provider = ? AND provider_payment_id = ?",
+                (provider, payment_id),
             ).fetchone()
         return None if row is None else _order(row)
 
@@ -431,9 +554,23 @@ class OrderStore:
             changed = connection.execute(
                 """
                 UPDATE orders SET status = ?
+                WHERE id = ? AND status IN (?, ?, ?)
+                """,
+                (REFUNDING, order_id, FULFILLED, FULFILLMENT_REVIEW, PAID),
+            ).rowcount
+            connection.commit()
+        return changed == 1
+
+    def release_refund(self, order_id: str, previous_status: str) -> bool:
+        if previous_status not in {FULFILLED, FULFILLMENT_REVIEW, PAID}:
+            raise ValueError("Invalid previous refund state")
+        with closing(self._connect()) as connection:
+            changed = connection.execute(
+                """
+                UPDATE orders SET status = ?
                 WHERE id = ? AND status = ?
                 """,
-                (REFUNDING, order_id, FULFILLED),
+                (previous_status, order_id, REFUNDING),
             ).rowcount
             connection.commit()
         return changed == 1

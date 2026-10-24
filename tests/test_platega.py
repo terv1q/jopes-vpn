@@ -45,7 +45,7 @@ class PlategaClientTests(unittest.IsolatedAsyncioTestCase):
                 order_id=order_id,
             )
             request = transport.requests[0]
-            self.assertEqual(request.url.path, "/v2/transaction/process")
+            self.assertEqual(request.url.path, "/transaction/process")
             self.assertEqual(request.headers["X-MerchantId"], merchant_id)
             self.assertEqual(request.headers["X-Secret"], "test-secret")
             self.assertEqual(
@@ -57,6 +57,7 @@ class PlategaClientTests(unittest.IsolatedAsyncioTestCase):
                     "return": "https://example.test/success",
                     "failedUrl": "https://example.test/failure",
                     "payload": order_id,
+                    "orderId": order_id,
                 },
             )
             self.assertEqual(result.transaction_id, transaction_id)
@@ -99,6 +100,30 @@ class PlategaClientTests(unittest.IsolatedAsyncioTestCase):
                         "status": "CONFIRMED",
                     },
                 )
+        finally:
+            await client.close()
+
+    async def test_method_specific_payment_response_without_status_is_pending(self) -> None:
+        transport = QueueTransport(
+            {
+                "transactionId": str(uuid4()),
+                "redirect": "https://pay.example.test/transaction",
+                "return": "https://example.test/success",
+            }
+        )
+        client = PlategaClient(str(uuid4()), "test-secret", transport=transport)
+        try:
+            result = await client.create_payment(
+                amount=Decimal("50"),
+                currency="RUB",
+                payment_method=11,
+                description="Jopes VPN",
+                return_url="https://example.test/success",
+                failed_url="https://example.test/failure",
+                order_id=str(uuid4()),
+            )
+            self.assertEqual(result.status, "PENDING")
+            self.assertEqual(result.url, "https://pay.example.test/transaction")
         finally:
             await client.close()
 

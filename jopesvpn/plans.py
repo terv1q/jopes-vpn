@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 
 from jopesvpn.i18n import t
+
+MIN_RUB_TOPUP_MINOR = 100
 
 
 class PlansError(ValueError):
@@ -263,19 +265,7 @@ def format_rubles(amount_minor: int) -> str:
     return f"{amount} ₽"
 
 
-def stars_for_rub_amount(
-    amount_minor: int,
-    plans: tuple[Plan, ...],
-    *,
-    minimum_minor: int = 25_000,
-    maximum_minor: int = 10_000_000,
-) -> int:
-    if (
-        isinstance(amount_minor, bool)
-        or not isinstance(amount_minor, int)
-        or not minimum_minor <= amount_minor <= maximum_minor
-    ):
-        raise ValueError("Top-up amount is out of range")
+def _topup_term(plans: tuple[Plan, ...]) -> PlanTerm:
     term = next(
         (
             term
@@ -288,6 +278,41 @@ def stars_for_rub_amount(
     )
     if term is None:
         raise ValueError("Tariff catalog has no priced terms")
+    return term
+
+
+def max_rub_topup_minor(
+    plans: tuple[Plan, ...], *, maximum_stars: int = 10_000
+) -> int:
+    term = _topup_term(plans)
+    return int(
+        (
+            Decimal(maximum_stars)
+            * Decimal(term.price_rub_minor)
+            / Decimal(term.stars_amount)
+        ).to_integral_value(rounding=ROUND_FLOOR)
+    )
+
+
+def stars_for_rub_amount(
+    amount_minor: int,
+    plans: tuple[Plan, ...],
+    *,
+    minimum_minor: int = MIN_RUB_TOPUP_MINOR,
+    maximum_minor: int | None = None,
+) -> int:
+    maximum_minor = (
+        max_rub_topup_minor(plans)
+        if maximum_minor is None
+        else maximum_minor
+    )
+    if (
+        isinstance(amount_minor, bool)
+        or not isinstance(amount_minor, int)
+        or not minimum_minor <= amount_minor <= maximum_minor
+    ):
+        raise ValueError("Top-up amount is out of range")
+    term = _topup_term(plans)
     rub_per_star = Decimal(term.price_rub_minor) / Decimal(term.stars_amount)
     stars = int(
         (Decimal(amount_minor) / rub_per_star).to_integral_value(

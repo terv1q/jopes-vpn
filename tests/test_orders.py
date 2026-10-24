@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import tempfile
 import sqlite3
+import tempfile
 import unittest
+import uuid
 from contextlib import closing
 from pathlib import Path
 
@@ -17,8 +18,7 @@ from jopesvpn.orders import (
     OrderStore,
     PlanPriceMissing,
 )
-from jopesvpn.plans import Plan
-from jopesvpn.plans import load_plans, term_savings
+from jopesvpn.plans import Plan, load_plans, term_savings
 
 
 def plan(price_minor: int | None = 49900) -> Plan:
@@ -83,6 +83,38 @@ class OrderStoreTests(unittest.TestCase):
             )
         self.assertEqual(self.store.get(second.id).status, PENDING)
 
+    def test_platega_link_is_persisted_and_confirmed_idempotently(self):
+        plan = next(item for item in load_plans() if item.sellable)
+        term = plan.term_for(30)
+        self.assertIsNotNone(term)
+        order = self.store.create_order(12345, plan, term, provider="platega")
+        transaction_id = str(uuid.uuid4())
+        saved = self.store.save_payment_link(
+            order.id, transaction_id, "https://pay.example.test/checkout"
+        )
+        self.assertEqual(saved.provider_payment_id, transaction_id)
+        self.assertEqual(
+            self.store.get_by_payment_id(transaction_id, provider="platega").id,
+            order.id,
+        )
+        paid, changed = self.store.confirm_payment(
+            order.id,
+            provider="platega",
+            provider_payment_id=transaction_id,
+            amount_minor=order.amount_minor,
+            currency="RUB",
+        )
+        self.assertTrue(changed)
+        duplicate, changed_again = self.store.confirm_payment(
+            order.id,
+            provider="platega",
+            provider_payment_id=transaction_id,
+            amount_minor=order.amount_minor,
+            currency="RUB",
+        )
+        self.assertFalse(changed_again)
+        self.assertEqual(duplicate.status, paid.status)
+
     def test_wrong_amount_does_not_confirm_the_order(self):
         order = self.store.create_order(12345, plan())
         with self.assertRaises(OrderConflict):
@@ -141,6 +173,75 @@ class OrderStoreTests(unittest.TestCase):
         self.assertTrue(self.store.mark_refunded(order.id))
         self.assertFalse(self.store.mark_refunded(order.id))
         self.assertEqual(self.store.get(order.id).status, REFUNDED)
+
+    def test_review_order_can_be_retried_only_once(self):
+        order = self.store.create_order(12345, plan())
+        self.store.confirm_payment(
+            order.id,
+            provider="test-provider",
+            provider_payment_id="payment-recovery",
+            amount_minor=49900,
+            currency="RUB",
+        )
+        self.store.claim_fulfillment(order.id)
+        self.store.mark_fulfillment_review(order.id)
+        self.assertTrue(self.store.claim_recovery_retry(order.id))
+        self.assertEqual(self.store.get(order.id).status, "FULFILLING")
+        self.store.mark_fulfillment_review(order.id)
+        self.assertFalse(self.store.claim_recovery_retry(order.id))
+
+    def test_paid_order_can_be_moved_to_review_for_failed_payment_recording(self):
+        order = self.store.create_order(12345, plan())
+        self.store.confirm_payment(
+            order.id,
+            provider="test-provider",
+            provider_payment_id="payment-recording-review",
+            amount_minor=49900,
+            currency="RUB",
+        )
+        self.store.mark_fulfillment_review(order.id)
+        self.assertEqual(self.store.get(order.id).status, FULFILLMENT_REVIEW)
+
+    def test_review_order_refund_is_claimed_once(self):
+        order = self.store.create_order(12345, plan())
+        self.store.confirm_payment(
+            order.id,
+            provider="test-provider",
+            provider_payment_id="payment-review-refund",
+            amount_minor=49900,
+            currency="RUB",
+        )
+        self.store.claim_fulfillment(order.id)
+        self.store.mark_fulfillment_review(order.id)
+        self.assertTrue(self.store.claim_refund(order.id))
+        self.assertFalse(self.store.claim_refund(order.id))
+        self.assertTrue(self.store.mark_refunded(order.id))
+        self.assertEqual(self.store.get(order.id).status, REFUNDED)
+
+    def test_payment_completion_callback_shares_fulfillment_transaction(self):
+        order = self.store.create_order(12345, plan())
+        self.store.confirm_payment(
+            order.id,
+            provider="test-provider",
+            provider_payment_id="payment-atomic-completion",
+            amount_minor=49900,
+            currency="RUB",
+        )
+        self.store.claim_fulfillment(order.id)
+
+        def fail_completion(connection, _order_id):
+            connection.execute(
+                "UPDATE orders SET status = ? WHERE id = ?",
+                ("REFUNDED", order.id),
+            )
+            raise RuntimeError("forced rollback")
+
+        with self.assertRaises(RuntimeError):
+            self.store.mark_fulfilled(
+                order.id,
+                payment_completer=fail_completion,
+            )
+        self.assertEqual(self.store.get(order.id).status, "FULFILLING")
 
     def test_unpriced_plan_cannot_create_an_order(self):
         with self.assertRaises(PlanPriceMissing):

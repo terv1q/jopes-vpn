@@ -7,9 +7,14 @@ from contextlib import closing
 from pathlib import Path
 
 from jopesvpn.orders import PAID, OrderStore
-from jopesvpn.plans import load_plans, stars_for_rub_amount
+from jopesvpn.plans import (
+    load_plans,
+    max_rub_topup_minor,
+    stars_for_rub_amount,
+)
 from jopesvpn.preferences import PreferencesStore
 from jopesvpn.wallet import (
+    MAX_TOPUP_MINOR,
     MIN_TOPUP_MINOR,
     MIN_WITHDRAWAL_MINOR,
     InsufficientFunds,
@@ -136,6 +141,50 @@ class WalletStoreTests(unittest.TestCase):
             self.wallet.account(1001).referral_earned_minor,
             amount * 20 // 100,
         )
+
+    def test_platega_topup_persists_link_and_credits_once(self) -> None:
+        amount = 25_000
+        topup = self.wallet.create_topup(
+            3003, amount, 100, provider="platega"
+        )
+        transaction_id = "platega-tx-1"
+        saved = self.wallet.save_topup_payment_link(
+            topup.id, transaction_id, "https://pay.example.test/checkout"
+        )
+        self.assertEqual(
+            saved.provider_payment_url, "https://pay.example.test/checkout"
+        )
+        self.wallet.record_pending_payment(
+            payment_id=topup.id,
+            telegram_id=3003,
+            amount_minor=amount,
+            reference=f"topup_payment:{topup.id}",
+            external_payment_id=transaction_id,
+            purpose="topup",
+        )
+        credited, changed, _ = self.wallet.confirm_topup(
+            topup.id,
+            provider_payment_id=transaction_id,
+            amount_minor=amount,
+            currency="RUB",
+            provider="platega",
+        )
+        self.assertTrue(changed)
+        self.assertEqual(credited.status, "CREDITED")
+        duplicate, changed_again, _ = self.wallet.confirm_topup(
+            topup.id,
+            provider_payment_id=transaction_id,
+            amount_minor=amount,
+            currency="RUB",
+            provider="platega",
+        )
+        self.assertFalse(changed_again)
+        self.assertEqual(duplicate.status, "CREDITED")
+        self.assertEqual(self.wallet.account(3003).balance_minor, amount)
+        transaction = self.wallet.payment_transaction(topup.id)
+        self.assertIsNotNone(transaction)
+        self.assertEqual(transaction.method, "platega")
+        self.assertEqual(transaction.status, "SUCCESS")
 
     def test_topup_bonus_and_payment_history_are_atomic_and_idempotent(self) -> None:
         amount = 50_050
@@ -476,7 +525,7 @@ class WalletStoreTests(unittest.TestCase):
 
     def test_history_records_every_operation(self) -> None:
         self.wallet.credit(
-            1001, MIN_TOPUP_MINOR, kind="TOPUP", reference="topup:history"
+            1001, 10_000, kind="TOPUP", reference="topup:history"
         )
         self.wallet.debit(
             1001, 5_000, kind="PURCHASE", reference="order:history"
@@ -484,7 +533,7 @@ class WalletStoreTests(unittest.TestCase):
         entries = self.wallet.history(1001)
         self.assertEqual([entry.kind for entry in entries], ["PURCHASE", "TOPUP"])
         self.assertEqual(entries[0].balance_delta_minor, -5_000)
-        self.assertEqual(entries[1].balance_delta_minor, MIN_TOPUP_MINOR)
+        self.assertEqual(entries[1].balance_delta_minor, 10_000)
 
 
 class TopupPricingTests(unittest.TestCase):
@@ -496,9 +545,17 @@ class TopupPricingTests(unittest.TestCase):
     def test_topup_bounds_are_validated(self) -> None:
         plans = load_plans()
         with self.assertRaises(ValueError):
-            stars_for_rub_amount(24_999, plans)
+            stars_for_rub_amount(MIN_TOPUP_MINOR - 1, plans)
         with self.assertRaises(ValueError):
-            stars_for_rub_amount(10_000_001, plans)
+            stars_for_rub_amount(MAX_TOPUP_MINOR + 1, plans)
+
+    def test_topup_maximum_matches_10000_stars_limit(self) -> None:
+        plans = load_plans()
+        maximum = max_rub_topup_minor(plans)
+        self.assertEqual(MAX_TOPUP_MINOR, maximum)
+        self.assertEqual(stars_for_rub_amount(maximum, plans), 10_000)
+        with self.assertRaises(ValueError):
+            stars_for_rub_amount(maximum + 1, plans)
 
 
 if __name__ == "__main__":

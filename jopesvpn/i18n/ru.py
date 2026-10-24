@@ -192,12 +192,12 @@ MESSAGES: dict[str, object] = {
     "wallet.open_button": "💰 Баланс и история",
     "wallet.topup_title": "ПОПОЛНЕНИЕ БАЛАНСА",
     "wallet.topup_intro": (
-        "Введите сумму от {minimum} до {maximum}. Бот рассчитает стоимость "
-        "в Telegram Stars, а после оплаты зачислит рубли на баланс."
+        "Выберите или введите сумму от {minimum} до {maximum}. "
+        "После оплаты деньги автоматически поступят на баланс."
     ),
     "wallet.topup_rate_note": (
-        "Курс соответствует тарифам каталога. Начисляется ровно введённая "
-        "сумма в рублях. Оплата проходит через Telegram Stars."
+        "На баланс поступит указанная сумма в рублях и действующий бонус пополнения. "
+        "Стоимость в Telegram Stars рассчитывается по курсу каталога."
     ),
     "wallet.topup_preset": "{amount} · {stars} ⭐",
     "wallet.topup_custom": "✍️ Ввести другую сумму",
@@ -219,10 +219,41 @@ MESSAGES: dict[str, object] = {
         "Доступный баланс: {balance}."
     ),
     "wallet.pay_stars": "Оплатить Telegram Stars · {stars} ⭐",
+    "platega.payment_link": (
+        "К оплате: <b>{amount}</b>\n"
+        "ID операции: <code>{payment_id}</code>\n"
+        "После оплаты бот автоматически подтвердит платёж и пришлёт уведомление."
+    ),
+    "platega.payment_pending": "Платёж ещё не подтверждён.",
+    "platega.status_pending": "Платёж ожидает оплаты.",
+    "platega.status_canceled": "Платёж отменён.",
+    "platega.status_confirmed": "Платёж подтверждён.",
+    "platega.status_refunded": "Возврат подтверждён.",
+    "platega.status_review": "Оплата принята и передана на проверку.",
+    "platega.refund_admin": (
+        "ℹ️ Подтверждён возврат по операции <code>{payment_id}</code>."
+    ),
     "wallet.payment_method_prompt": (
         "Сумма пополнения: <b>{amount}</b>\n"
-        "К оплате: <b>{stars} ⭐</b> по курсу каталога.\n"
-        "Доступен только Telegram Stars; другие способы оплаты не подключены."
+        "Выберите способ оплаты. Зачисление произойдёт автоматически."
+    ),
+    "payments.method_sbp": "СБП QR",
+    "payments.method_erip": "ЕРИП",
+    "payments.method_card": "Карта",
+    "payments.method_international": "Международная оплата",
+    "payments.method_crypto": "Криптовалюта",
+    "payments.method_sberpay": "SberPay",
+    "payments.open_payment": "💳 Перейти к оплате",
+    "payments.subscription_success": "✅ Оплата подтверждена. Подписка активирована.",
+    "payments.check_queued": "Проверяю оплату. Результат придёт автоматически.",
+    "payments.select_amount": "Выберите сумму пополнения.",
+    "payments.method_unavailable": (
+        "Этот способ оплаты сейчас недоступен для выбранной суммы. "
+        "Выберите другой способ или увеличьте сумму."
+    ),
+    "payments.status_screen": (
+        "{status}\nСумма: <b>{amount}</b>\n"
+        "ID операции: <code>{payment_id}</code>"
     ),
     "wallet.receipt": (
         "\n\n<b>Чек операции</b>\n"
@@ -239,6 +270,7 @@ MESSAGES: dict[str, object] = {
     "wallet.receipt_method_stars": "Telegram Stars",
     "wallet.receipt_method_balance": "Баланс в рублях",
     "wallet.receipt_method_manual": "Через поддержку",
+    "wallet.receipt_method_online": "Онлайн-оплата",
     "wallet.receipt_result_success": "Успешно",
     "wallet.topup_review": (
         "Оплата получена, но зачисление задержалось. Мы проверим операцию; "
@@ -318,7 +350,9 @@ MESSAGES: dict[str, object] = {
     "admin.users": "👥 Все пользователи",
     "admin.logs": "📡 Логи подключений",
     "admin.broadcast": "📣 Рассылка",
+    "admin.promo_posts": "🎁 Промопост",
     "admin.wallet_menu": "💰 Балансы и бонусы",
+    "admin.platega_payments": "💳 Онлайн-платежи",
     "admin.wallet_title": "<b>Баланс пользователей и бонусы пополнения</b>",
     "admin.wallet_adjust_button": "Изменить баланс пользователя",
     "admin.wallet_bonus_button": "Настроить бонус пополнения",
@@ -332,6 +366,18 @@ MESSAGES: dict[str, object] = {
         "Пользователь: <code>{telegram_id}</code>\n"
         "Сумма: {amount}\nМетод: {method}\nНазначение: {purpose}\n"
         "Статус: {status}\nСоздана: {created_at}"
+    ),
+    "admin.platega_status": "Статус платежа: {status}.",
+    "admin.platega_refund_confirm": (
+        "Запросить возврат по операции <code>{payment_id}</code> "
+        "на сумму {amount}?"
+    ),
+    "admin.platega_refund_requested": (
+        "Запрос на возврат принят. Бот автоматически проверит результат "
+        "и сообщит о подтверждении возврата."
+    ),
+    "admin.platega_refund_unavailable": (
+        "Возврат недоступен, не подтверждён или требует ручной обработки."
     ),
     "admin.wallet_adjust_prompt": (
         "Отправьте ID пользователя, сумму и обязательную причину через пробел. "
@@ -381,6 +427,211 @@ MESSAGES: dict[str, object] = {
     "admin.broadcast_result": (
         "Рассылка завершена.\nДоставлено: {delivered} из {total}.\n"
         "Не доставлено: {failed}."
+    ),
+    "admin.broadcasts_title": (
+        "<b>📣 РАССЫЛКИ</b>\n\n"
+        "Создайте рассылку под выбранную аудиторию. Текст и кнопки "
+        "настраиваются прямо в боте."
+    ),
+    "admin.bcast_new": "➕ Новая рассылка",
+    "admin.bcast_empty": "Сохранённых рассылок пока нет.",
+    "admin.bcast_row": "#{id} · {status}",
+    "admin.bcast_status_draft": "черновик",
+    "admin.bcast_status_sending": "отправляется",
+    "admin.bcast_status_sent": "отправлена",
+    "admin.bcast_status_failed": "ошибка",
+    "admin.bcast_aud_all": "Все пользователи бота",
+    "admin.bcast_aud_subscribed": "Есть подписка",
+    "admin.bcast_aud_active": "Активная подписка",
+    "admin.bcast_aud_never": "Подписка есть, подключений не было",
+    "admin.bcast_aud_inactive": "Не подключался 24+ часа",
+    "admin.bcast_aud_active_inactive": (
+        "Активная подписка и нет подключений 24+ часа"
+    ),
+    "admin.bcast_prompt": (
+        "Отправьте текст рассылки одним сообщением. Поддерживается HTML: "
+        "<code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;a&gt;</code>. "
+        "Для отмены отправьте /cancel."
+    ),
+    "admin.bcast_prompt_edit": (
+        "Отправьте новый текст рассылки. Для отмены отправьте /cancel."
+    ),
+    "admin.bcast_text_invalid": (
+        "Текст должен быть непустым и не длиннее 4096 символов."
+    ),
+    "admin.bcast_html_invalid": (
+        "Telegram не принял HTML в тексте. Проверьте закрытие тегов и "
+        "отправьте текст снова."
+    ),
+    "admin.bcast_preview_failed": "Не удалось показать предпросмотр.",
+    "admin.bcast_preview_title": "Предпросмотр рассылки",
+    "admin.bcast_control_title": "<b>Рассылка #{id}</b>",
+    "admin.bcast_audience_line": "Аудитория: <b>{audience}</b>",
+    "admin.bcast_buttons_line": "Кнопок: <b>{count}</b>",
+    "admin.bcast_status_line": "Статус: <b>{status}</b>",
+    "admin.bcast_delivery_line": (
+        "Доставлено: <b>{delivered}</b>, ошибок: <b>{failed}</b>"
+    ),
+    "admin.bcast_control_note": (
+        "Проверьте предпросмотр выше. Кнопки в предпросмотре кликабельны."
+    ),
+    "admin.bcast_audience_button": "👥 Аудитория",
+    "admin.bcast_buttons_button": "🔗 Кнопки",
+    "admin.bcast_edit_text": "✏️ Изменить текст",
+    "admin.bcast_test": "👁 Отправить себе",
+    "admin.bcast_confirm": "✅ Проверить и отправить",
+    "admin.bcast_list": "📋 К списку рассылок",
+    "admin.bcast_delete": "🗑 Удалить черновик",
+    "admin.bcast_audience_title": (
+        "<b>👥 АУДИТОРИЯ</b>\n\nВыберите получателей рассылки."
+    ),
+    "admin.bcast_audience_saved": "Аудитория обновлена.",
+    "admin.bcast_audience_invalid": "Неизвестная аудитория.",
+    "admin.bcast_buttons_title": (
+        "<b>🔗 КНОПКИ</b>\n\nДо 8 HTTPS-кнопок. Каждая открывает ссылку."
+    ),
+    "admin.bcast_buttons_empty": "Кнопок пока нет.",
+    "admin.bcast_buttons_list": "Кнопка {index}: {label} · {url}",
+    "admin.bcast_add_button": "➕ Добавить кнопку",
+    "admin.bcast_clear_buttons": "🧹 Удалить все кнопки",
+    "admin.bcast_button_label_prompt": (
+        "Отправьте подпись кнопки, до 64 символов."
+    ),
+    "admin.bcast_button_url_prompt": (
+        "Отправьте HTTPS-ссылку для кнопки. Для отмены отправьте /cancel."
+    ),
+    "admin.bcast_button_invalid": (
+        "Нужна корректная HTTPS-ссылка без пробелов и логина в адресе."
+    ),
+    "admin.bcast_button_label_invalid": (
+        "Подпись кнопки должна быть непустой и не длиннее 64 символов."
+    ),
+    "admin.bcast_button_added": "Кнопка добавлена.",
+    "admin.bcast_buttons_cleared": "Все кнопки удалены.",
+    "admin.bcast_buttons_limit": "Достигнут лимит: 8 кнопок.",
+    "admin.bcast_test_sent": "Предпросмотр отправлен вам.",
+    "admin.bcast_test_failed": (
+        "Telegram не принял сообщение. Проверьте HTML и ссылки кнопок."
+    ),
+    "admin.bcast_confirm_title": (
+        "<b>✅ ПРОВЕРКА ПЕРЕД ОТПРАВКОЙ</b>"
+    ),
+    "admin.bcast_confirm_audience": "Аудитория: <b>{audience}</b>",
+    "admin.bcast_confirm_recipients": "Получателей: <b>{count}</b>",
+    "admin.bcast_confirm_errors": (
+        "Не удалось проверить аккаунтов: <b>{errors}</b>. Они пропущены."
+    ),
+    "admin.bcast_confirm_buttons": "Кнопок: <b>{count}</b>",
+    "admin.bcast_launch": "🚀 Отправить",
+    "admin.bcast_no_recipients": (
+        "В выбранной аудитории нет получателей. Рассылка не отправлена."
+    ),
+    "admin.bcast_launch_progress": (
+        "Отправляю рассылку #{id}. Не запускайте её повторно."
+    ),
+    "admin.bcast_result": (
+        "Рассылка #{id} завершена.\nОтправлено: {delivered}.\n"
+        "Ошибок: {failed}.\nУже были доставлены ранее: {skipped}."
+    ),
+    "admin.bcast_unavailable": (
+        "Хранилище рассылок недоступно. Действие не выполнено."
+    ),
+    "admin.bcast_not_found": "Рассылка не найдена.",
+    "admin.bcast_deleted": "Черновик рассылки удалён.",
+    "admin.bcast_cancelled": "Действие отменено.",
+    "admin.bcast_already_sent": (
+        "Эта рассылка уже отправлена. Создайте новую."
+    ),
+    "admin.bcast_busy": (
+        "Другая рассылка уже отправляется. Дождитесь завершения."
+    ),
+
+    "promo.builder.title": "🎁 Создание промопоста",
+    "promo.builder.choose_text": (
+        "Согласованный текст акции:\n\n{body}\n\n"
+        "Используйте его или отправьте свою редакцию."
+    ),
+    "promo.builder.edit_text": "Отправьте новый текст промопоста одним сообщением.",
+    "promo.builder.text_invalid": (
+        "Текст слишком длинный или пустой. Отправьте текст до 1024 символов "
+        "или /cancel."
+    ),
+    "promo.builder.photo_prompt": (
+        "Пришлите фотографию или продолжите без неё."
+    ),
+    "promo.builder.photo_saved": "Фотография добавлена.",
+    "promo.builder.buttons_prompt": (
+        "Основная кнопка акции будет зелёной и откроет бота для получения подарка. "
+        "При желании добавьте до 7 ссылок или сразу откройте предпросмотр."
+    ),
+    "promo.builder.button_label": "Отправьте подпись для дополнительной кнопки.",
+    "promo.builder.button_url": (
+        "Отправьте HTTPS-ссылку для кнопки или /cancel."
+    ),
+    "promo.builder.button_invalid": (
+        "Нужна корректная HTTPS-ссылка. Попробуйте ещё раз или отправьте /cancel."
+    ),
+    "promo.builder.preview": "Предпросмотр промопоста:",
+    "promo.builder.controls": (
+        "Проверьте текст, фото и кнопки. Можно вернуться к тексту, "
+        "заменить фото, настроить ссылки или отправить разработчику."
+    ),
+    "promo.builder.submitted": (
+        "Пост отправлен главному разработчику на согласование. "
+        "В канал он не попадёт, пока разработчик не нажмёт «Опубликовать в ТГК»."
+    ),
+    "promo.builder.cancelled": "Создание промопоста отменено.",
+    "promo.builder.unavailable": (
+        "Не удалось сохранить промопост. Ничего не опубликовано."
+    ),
+    "promo.builder.review_photo_prompt": (
+        "Пришлите фотографию для предпросмотра. Публикация по-прежнему потребует "
+        "отдельного подтверждения."
+    ),
+    "promo.builder.review_photo_saved": (
+        "Фото обновлено в предпросмотре. Публикация не выполнялась."
+    ),
+    "promo.builder.review_photo_expired": (
+        "Этот запрос уже обработан. Новое фото не добавлено."
+    ),
+    "promo.approval_publish": "Опубликовать в ТГК",
+    "promo.approval_reject": "Отклонить",
+    "promo.approval_photo": "Добавить фото",
+    "promo.review_details": (
+        "<b>Промопост #{post_id}</b>\n"
+        "Подготовил: {creator} · ID {creator_id}\n"
+        "Условия: первые 5 новых пользователей без ранее активированных "
+        "подписок, включая trial, получают 15 дней безлимита; первые 3 "
+        "пользователя, ранее активировавшие подписку, получают 7 дней. "
+        "Активная подписка продлевается, завершённая включается на 7 дней.\n"
+        "Одна награда на Telegram-аккаунт.\n"
+        "Фото: {photo}\n"
+        "Подготовка:\n{log}"
+    ),
+    "promo.claim_new": (
+        "🎉 Подарок получен: 15 дней безлимитного доступа. "
+        "Откройте личный кабинет, чтобы посмотреть срок подписки."
+    ),
+    "promo.claim_returning": (
+        "🎉 Подарок получен: добавлено 7 дней доступа. "
+        "Откройте личный кабинет, чтобы посмотреть срок подписки."
+    ),
+    "promo.claim_duplicate": "Подарок по этой акции уже был выдан вашему аккаунту.",
+    "promo.claim_processing": (
+        "Проверяем выдачу подарка. Повторно нажимать кнопку не нужно."
+    ),
+    "promo.claim_full": "Места в вашей категории уже закончились.",
+    "promo.claim_inactive": "Эта акция завершена или ещё не опубликована.",
+    "promo.claim_unavailable": (
+        "Сейчас не удалось проверить подписку. Попробуйте позже."
+    ),
+    "promo.claim_status": (
+        "Не получилось безопасно выдать подарок автоматически. "
+        "Мы передали запрос разработчику для проверки."
+    ),
+    "promo.claim_review_admin": (
+        "Требуется сверить выдачу промоподарка.\nПользователь: {user_id}\n"
+        "Пост: #{post_id}\nОшибка: {error}"
     ),
     "admin.open_chat": "💬 Перейти в личный чат",
     "admin.logs_title": "📡 ЛОГИ ПОДКЛЮЧЕНИЙ",
@@ -643,6 +894,12 @@ MESSAGES: dict[str, object] = {
         "сюда, в бот."
     ),
 
+    "start.welcome": (
+        "<b>Добро пожаловать в Jopes VPN</b>\n\n"
+        "<b>{name}</b>, рады видеть вас!\n\n"
+        "Ваш VPN — дома и в дороге.\n"
+        "Подключение по шагам. Поддержка рядом."
+    ),
     "home.greeting": "Здравствуйте, <b>{name}</b>.",
     "home.hint_active": (
         "Нажмите «Подключить VPN», чтобы открыть страницу подписки. Выберите "
@@ -1011,7 +1268,28 @@ MESSAGES: dict[str, object] = {
         "⚠️ Оплаченный заказ требует проверки.\n"
         "Заказ: <code>{order_id}</code>\n"
         "Telegram ID: <code>{telegram_id}</code>\n"
-        "Тариф: {plan} · {amount} ⭐"
+        "Тариф: {plan} · {amount} ⭐\n\n"
+        "Возврат: <code>/recover_order {order_id} refund</code>\n"
+        "Повторная выдача только после проверки Panel: "
+        "<code>/recover_order {order_id} retry NOT_FULFILLED</code>"
+    ),
+    "plans.recovery_retry_done": (
+        "Повторная выдача выполнена по заказу <code>{order_id}</code>."
+    ),
+    "plans.recovery_retry_failed": (
+        "Повторная выдача не завершена. Повтор недоступен, чтобы не выдать "
+        "доступ дважды. Проверьте заказ вручную."
+    ),
+    "plans.recovery_usage": (
+        "/recover_order <order_id> refund\n"
+        "/recover_order <order_id> retry NOT_FULFILLED"
+    ),
+    "plans.recovery_unavailable": (
+        "Действие недоступно. Проверьте статус заказа и выполненную операцию."
+    ),
+    "plans.recovery_retry_warning": (
+        "Перед повтором вручную проверьте Panel: предыдущая выдача не должна "
+        "быть применена. Повтор доступен один раз."
     ),
     "plans.time_limit_note": (
         "Покупка продлевает срок активного доступа. Пакет трафика добавляется "
@@ -1426,6 +1704,7 @@ MESSAGES: dict[str, object] = {
     "ticket.message_too_long": "Сообщение слишком длинное. Сократите его до 4000 символов.",
     "ticket.message_empty": "Отправьте текст или скриншот.",
     "ticket.unavailable": "Не удалось сохранить обращение. Попробуйте ещё раз позже.",
+    "ticket.rate_limited": "Слишком часто. Повторите примерно через {wait}.",
     "ticket.admin_notify_failed": (
         "Обращение сохранено, но уведомление поддержки не доставлено. "
         "Оно осталось в очереди."

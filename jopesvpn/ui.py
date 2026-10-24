@@ -7,6 +7,7 @@ from urllib.parse import quote, urlsplit
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from jopesvpn.broadcasts import AUDIENCES, BroadcastDraft
 from jopesvpn.i18n import (
     LANGUAGE_FLAGS,
     SUPPORTED_LANGUAGES,
@@ -20,6 +21,7 @@ from jopesvpn.plans import (
     PlanTerm,
     format_price,
     format_rubles,
+    max_rub_topup_minor,
     term_savings,
     title_for_panel_tag,
 )
@@ -33,6 +35,7 @@ from jopesvpn.timezones import (
 from jopesvpn.wallet import (
     MIN_TOPUP_MINOR,
     MIN_WITHDRAWAL_MINOR,
+    TOPUP_PRESET_AMOUNTS,
     PaymentTransaction,
     WithdrawalRequest,
 )
@@ -414,7 +417,9 @@ def plan_terms_keyboard(plan: Plan) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def payment_methods_keyboard(plan: Plan, term: PlanTerm) -> InlineKeyboardMarkup:
+def payment_methods_keyboard(
+    plan: Plan, term: PlanTerm, *, platega_enabled: bool = False
+) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
@@ -432,20 +437,40 @@ def payment_methods_keyboard(plan: Plan, term: PlanTerm) -> InlineKeyboardMarkup
             )
         ],
     ]
-    for method in ("sbp", "card", "crypto"):
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=t(
-                        f"plans.pay_{method}",
-                        amount=format_rubles(term.price_rub_minor),
-                    )[:64],
-                    callback_data=(
-                        f"pay:unavailable:{method}:{plan.code}:{term.days}"
-                    ),
-                )
-            ]
-        )
+    if platega_enabled:
+        for provider_method, key in (
+            (2, "payments.method_sbp"),
+            (3, "payments.method_erip"),
+            (11, "payments.method_card"),
+            (12, "payments.method_international"),
+            (13, "payments.method_crypto"),
+            (14, "payments.method_sberpay"),
+        ):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{t(key)} · {format_rubles(term.price_rub_minor)}"[:64],
+                        callback_data=(
+                            f"pay:platega:{plan.code}:{term.days}:{provider_method}"
+                        ),
+                    )
+                ]
+            )
+    else:
+        for method in ("sbp", "card", "crypto"):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=t(
+                            f"plans.pay_{method}",
+                            amount=format_rubles(term.price_rub_minor),
+                        )[:64],
+                        callback_data=(
+                            f"pay:unavailable:{method}:{plan.code}:{term.days}"
+                        ),
+                    )
+                ]
+            )
     rows.append(
         [
             InlineKeyboardButton(
@@ -1292,14 +1317,14 @@ def wallet_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def topup_text() -> str:
+def topup_text(plans: tuple[Plan, ...]) -> str:
     return "\n\n".join(
         [
             _heading(t("wallet.topup_title")),
             t(
                 "wallet.topup_intro",
                 minimum=format_rubles(MIN_TOPUP_MINOR),
-                maximum=format_rubles(10_000_000),
+                maximum=format_rubles(max_rub_topup_minor(plans)),
             ),
             t("wallet.topup_rate_note"),
         ]
@@ -1309,7 +1334,7 @@ def topup_text() -> str:
 def topup_amount_keyboard(
     stars_for: dict[int, int] | None = None,
 ) -> InlineKeyboardMarkup:
-    amounts = (25_000, 50_000, 100_000, 200_000)
+    amounts = TOPUP_PRESET_AMOUNTS
     stars_for = stars_for or {}
     rows = [
         [
@@ -1356,13 +1381,35 @@ def topup_custom_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def topup_methods_keyboard(stars: int) -> InlineKeyboardMarkup:
-    return keyboard(
-        [
-            [(t("wallet.pay_stars", stars=stars), "topup:pay:stars")],
-            [(t("common.cancel"), "topup:cancel")],
-        ]
-    )
+def topup_methods_keyboard(
+    stars: int, *, amount_minor: int | None = None, platega_enabled: bool = False
+) -> InlineKeyboardMarkup:
+    suffix = "" if amount_minor is None else f":{amount_minor}"
+    rows = [[(t("wallet.pay_stars", stars=stars), f"topup:pay:stars{suffix}")]]
+    if platega_enabled:
+        rows.extend(
+            [[(t(key), f"topup:pay:platega:{method}{suffix}")]
+             for method, key in (
+                 (2, "payments.method_sbp"),
+                 (3, "payments.method_erip"),
+                 (11, "payments.method_card"),
+                 (12, "payments.method_international"),
+                 (13, "payments.method_crypto"),
+                 (14, "payments.method_sberpay"),
+             )]
+        )
+    rows.append([(t("common.cancel"), "topup:cancel")])
+    return keyboard(rows)
+
+
+def payment_method_text(method: str) -> str:
+    key = {
+        "telegram_stars": "wallet.receipt_method_stars",
+        "wallet": "wallet.receipt_method_balance",
+        "manual": "wallet.receipt_method_manual",
+        "platega": "wallet.receipt_method_online",
+    }.get(method)
+    return method if key is None else t(key)
 
 
 def payment_receipt_text(
@@ -1380,6 +1427,19 @@ def payment_receipt_text(
         amount=amount,
         method=method,
         result=result,
+    )
+
+
+def platega_payment_keyboard(
+    payment_url: str, payment_kind: str, local_id: str
+) -> InlineKeyboardMarkup:
+    if payment_kind not in {"order", "topup"} or not local_id:
+        raise ValueError("Invalid Platega payment reference")
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t("payments.open_payment"), url=payment_url)],
+            [InlineKeyboardButton(text=t("common.menu"), callback_data="user:home")],
+        ]
     )
 
 
@@ -1854,18 +1914,115 @@ def admin_keyboard() -> InlineKeyboardMarkup:
             [(t("admin.logs"), "admin:logs")],
             [(t("admin.status"), "admin:status")],
             [(t("admin.wallet_menu"), "admin:wallet")],
+            [(t("admin.platega_payments"), "admin:payments")],
             [(t("docs.admin_menu"), "admin:docs")],
-            [(t("admin.broadcast"), "admin:broadcast")],
+            [(t("admin.broadcast"), "admin:broadcasts")],
+            [(t("admin.promo_posts"), "promo-builder:start")],
             [(t("common.menu"), "user:home")],
         ]
     )
 
 
-def broadcast_keyboard() -> InlineKeyboardMarkup:
+BROADCAST_AUDIENCE_LABELS = {
+    "all": "admin.bcast_aud_all",
+    "subscribed": "admin.bcast_aud_subscribed",
+    "active": "admin.bcast_aud_active",
+    "never": "admin.bcast_aud_never",
+    "inactive_24h": "admin.bcast_aud_inactive",
+    "active_inactive_24h": "admin.bcast_aud_active_inactive",
+}
+
+BROADCAST_STATUS_LABELS = {
+    "DRAFT": "admin.bcast_status_draft",
+    "SENDING": "admin.bcast_status_sending",
+    "SENT": "admin.bcast_status_sent",
+    "FAILED": "admin.bcast_status_failed",
+}
+
+
+def broadcast_audience_label(audience: str) -> str:
+    return t(BROADCAST_AUDIENCE_LABELS.get(audience, "admin.bcast_aud_all"))
+
+
+def broadcast_status_label(status: str) -> str:
+    return t(BROADCAST_STATUS_LABELS.get(status, "admin.bcast_status_draft"))
+
+
+def broadcasts_keyboard(drafts: list[BroadcastDraft]) -> InlineKeyboardMarkup:
+    rows = [[(t("admin.bcast_new"), "admin:bcast:new")]]
+    rows.extend(
+        [
+            (
+                t(
+                    "admin.bcast_row",
+                    id=draft.id,
+                    status=broadcast_status_label(draft.status),
+                ),
+                f"admin:bcast:open:{draft.id}",
+            )
+        ]
+        for draft in drafts
+    )
+    rows.append([(t("common.back"), "admin:home")])
+    return keyboard(rows)
+
+
+def broadcast_control_keyboard(draft: BroadcastDraft) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            (t("admin.bcast_audience_button"), f"admin:bcast:audience:{draft.id}"),
+            (t("admin.bcast_buttons_button"), f"admin:bcast:buttons:{draft.id}"),
+        ],
+        [(t("admin.bcast_edit_text"), f"admin:bcast:text:{draft.id}")],
+        [(t("admin.bcast_test"), f"admin:bcast:test:{draft.id}")],
+        [(t("admin.bcast_confirm"), f"admin:bcast:confirm:{draft.id}")],
+        [(t("admin.bcast_list"), "admin:broadcasts")],
+    ]
+    if draft.status in {"DRAFT", "FAILED"}:
+        rows.append(
+            [(t("admin.bcast_delete"), f"admin:bcast:delete:{draft.id}")]
+        )
+    return keyboard(rows)
+
+
+def broadcast_audience_keyboard(
+    draft_id: int, current: str
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            (
+                ("✅ " if audience == current else "")
+                + broadcast_audience_label(audience),
+                f"admin:bcast:aud:{draft_id}:{audience}",
+            )
+        ]
+        for audience in AUDIENCES
+    ]
+    rows.append([(t("common.back"), f"admin:bcast:open:{draft_id}")])
+    return keyboard(rows)
+
+
+def broadcast_buttons_keyboard(
+    draft_id: int, count: int
+) -> InlineKeyboardMarkup:
+    rows = []
+    if count < 8:
+        rows.append(
+            [(t("admin.bcast_add_button"), f"admin:bcast:button:add:{draft_id}")]
+        )
+    if count:
+        rows.append(
+            [(t("admin.bcast_clear_buttons"), f"admin:bcast:button:clear:{draft_id}")]
+        )
+    rows.append([(t("common.back"), f"admin:bcast:open:{draft_id}")])
+    return keyboard(rows)
+
+
+def broadcast_send_keyboard(draft_id: int) -> InlineKeyboardMarkup:
     return keyboard(
         [
-            [(t("admin.broadcast_send"), "admin:broadcast:send")],
-            [(t("common.cancel"), "admin:broadcast:cancel")],
+            [(t("admin.bcast_launch"), f"admin:bcast:launch:{draft_id}")],
+            [(t("common.cancel"), f"admin:bcast:open:{draft_id}")],
         ]
     )
 
@@ -1888,6 +2045,42 @@ def wallet_admin_keyboard() -> InlineKeyboardMarkup:
             [(t("common.back"), "admin:home")],
         ]
     )
+
+
+def platega_admin_keyboard(
+    transactions: list[PaymentTransaction], status: str
+) -> InlineKeyboardMarkup:
+    statuses = ("ALL", "PENDING", "CONFIRMED", "SUCCESS", "CANCELED", "REFUNDING", "REFUNDED", "REVIEW")
+    rows = [
+        [
+            (
+                ("• " if status == selected else "") + selected,
+                f"admin:payments:filter:{selected}",
+            )
+        ]
+        for selected in statuses
+    ]
+    for transaction in transactions[:20]:
+        if transaction.status in {"CONFIRMED", "SUCCESS", "REFUNDING"}:
+            rows.append(
+                [
+                    (
+                        "🔄 " + transaction.id[:8],
+                        f"admin:payments:check:{transaction.id}",
+                    ),
+                    (
+                        "↩️ Возврат",
+                        f"admin:payments:refund:{transaction.id}",
+                    ),
+                ]
+            )
+    rows.extend(
+        [
+            [("📤 Экспорт CSV", f"admin:payments:export:{status}")],
+            [(t("common.back"), "admin:home")],
+        ]
+    )
+    return keyboard(rows)
 
 
 ADMIN_USERS_PER_PAGE = 8

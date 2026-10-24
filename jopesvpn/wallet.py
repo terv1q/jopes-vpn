@@ -7,8 +7,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-MIN_TOPUP_MINOR = 25_000
-MAX_TOPUP_MINOR = 10_000_000
+from jopesvpn.plans import MIN_RUB_TOPUP_MINOR, load_plans, max_rub_topup_minor
+
+MIN_TOPUP_MINOR = MIN_RUB_TOPUP_MINOR
+TOPUP_PRESET_AMOUNTS = (MIN_TOPUP_MINOR, 5_000, 10_000, 50_000)
+MAX_TOPUP_MINOR = max_rub_topup_minor(load_plans())
+MAX_MANUAL_BALANCE_MINOR = 10_000_000
 MIN_WITHDRAWAL_MINOR = 25_000
 TOPUP_PENDING = "PENDING"
 TOPUP_CREDITED = "CREDITED"
@@ -83,8 +87,12 @@ class Topup:
     stars_amount: int
     status: str
     provider_payment_id: str | None
+    provider_payment_url: str | None
     created_at: str
     paid_at: str | None
+    provider: str = "telegram_stars"
+    provider_payment_method: int | None = None
+    provider_expires_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -142,8 +150,12 @@ def _topup(row: sqlite3.Row) -> Topup:
         stars_amount=int(row["stars_amount"]),
         status=str(row["status"]),
         provider_payment_id=row["provider_payment_id"],
+        provider_payment_url=row["provider_payment_url"],
         created_at=str(row["created_at"]),
         paid_at=row["paid_at"],
+        provider=row["provider"],
+        provider_payment_method=row["provider_payment_method"],
+        provider_expires_at=row["provider_expires_at"],
     )
 
 
@@ -299,8 +311,10 @@ class WalletStore:
                     telegram_id INTEGER NOT NULL,
                     amount_minor INTEGER NOT NULL,
                     stars_amount INTEGER NOT NULL,
+                    provider TEXT NOT NULL DEFAULT 'telegram_stars',
                     status TEXT NOT NULL,
                     provider_payment_id TEXT UNIQUE,
+                    provider_payment_url TEXT,
                     created_at TEXT NOT NULL,
                     paid_at TEXT,
                     UNIQUE (telegram_id, provider_payment_id)
@@ -326,6 +340,25 @@ class WalletStore:
                     "PRAGMA table_info(referral_purchases)"
                 ).fetchall()
             }
+            topup_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(wallet_topups)")
+            }
+            if "provider" not in topup_columns:
+                connection.execute(
+                    "ALTER TABLE wallet_topups ADD COLUMN provider TEXT NOT NULL DEFAULT 'telegram_stars'"
+                )
+            if "provider_payment_url" not in topup_columns:
+                connection.execute(
+                    "ALTER TABLE wallet_topups ADD COLUMN provider_payment_url TEXT"
+                )
+            for column, declaration in (
+                ("provider_payment_method", "INTEGER"),
+                ("provider_expires_at", "TEXT"),
+            ):
+                if column not in topup_columns:
+                    connection.execute(
+                        f"ALTER TABLE wallet_topups ADD COLUMN {column} {declaration}"
+                    )
             if "reversed_at" not in purchase_columns:
                 connection.execute(
                     "ALTER TABLE referral_purchases ADD COLUMN reversed_at TEXT"
@@ -386,7 +419,8 @@ class WalletStore:
                     CASE WHEN o.provider = 'balance' THEN 'RUB' ELSE o.currency END,
                     o.rub_price_minor,
                     CASE WHEN o.provider = 'balance'
-                        THEN 'wallet' ELSE 'telegram_stars' END,
+                        THEN 'wallet' WHEN o.provider = 'platega'
+                        THEN 'platega' ELSE 'telegram_stars' END,
                     'subscription',
                     CASE
                         WHEN o.status = 'REFUNDED' THEN 'REFUNDED'
@@ -414,8 +448,10 @@ class WalletStore:
                     rub_amount_minor, method, purpose, status, reference,
                     external_payment_id, created_at, updated_at
                 )
-                SELECT id, telegram_id, stars_amount, 'XTR', amount_minor,
-                    'telegram_stars', 'topup',
+                SELECT id, telegram_id,
+                    CASE WHEN provider = 'platega' THEN amount_minor ELSE stars_amount END,
+                    CASE WHEN provider = 'platega' THEN 'RUB' ELSE 'XTR' END, amount_minor,
+                    provider, 'topup',
                     CASE WHEN status = 'REFUNDED'
                         THEN 'REFUNDED' ELSE 'SUCCESS' END,
                     'topup_payment:' || id, provider_payment_id,
@@ -442,6 +478,10 @@ class WalletStore:
                 """
             )
             connection.commit()
+
+    @property
+    def database_path(self) -> Path:
+        return self._path
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path, timeout=10.0)
@@ -591,22 +631,161 @@ class WalletStore:
             raise WalletError("Cannot read payment history") from error
         return [self._payment_transaction(row) for row in rows]
 
+    def payment_transactions(
+        self,
+        *,
+        method: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[PaymentTransaction]:
+        if not 1 <= limit <= 50_000:
+            raise ValueError("Invalid payment transaction limit")
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if method is not None:
+            clauses.append("method = ?")
+            parameters.append(method)
+        if status is not None:
+            clauses.append("status = ?")
+            parameters.append(status)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        try:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    "SELECT * FROM payment_transactions"
+                    + where
+                    + " ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                    (*parameters, limit),
+                ).fetchall()
+        except sqlite3.Error as error:
+            raise WalletError("Cannot list payment transactions") from error
+        return [self._payment_transaction(row) for row in rows]
+
+    def payment_transaction_summary(
+        self, *, method: str
+    ) -> list[tuple[str, int, int]]:
+        try:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT status, COUNT(*) AS count,
+                        COALESCE(SUM(rub_amount_minor), 0) AS amount
+                    FROM payment_transactions
+                    WHERE method = ?
+                    GROUP BY status ORDER BY status
+                    """,
+                    (method,),
+                ).fetchall()
+        except sqlite3.Error as error:
+            raise WalletError("Cannot summarize payment transactions") from error
+        return [
+            (str(row["status"]), int(row["count"]), int(row["amount"]))
+            for row in rows
+        ]
+
+    def record_pending_payment(
+        self,
+        *,
+        payment_id: str,
+        telegram_id: int,
+        amount_minor: int,
+        reference: str,
+        external_payment_id: str,
+        purpose: str,
+    ) -> None:
+        if (
+            not payment_id or telegram_id <= 0 or amount_minor <= 0
+            or not reference or not external_payment_id
+            or purpose not in {"subscription", "topup"}
+        ):
+            raise ValueError("Invalid pending payment")
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                existing = connection.execute(
+                    "SELECT * FROM payment_transactions WHERE reference = ?",
+                    (reference,),
+                ).fetchone()
+                if existing is None:
+                    self._record_transaction_locked(
+                        connection,
+                        payment_id=payment_id,
+                        telegram_id=telegram_id,
+                        amount_paid_minor=amount_minor,
+                        currency="RUB",
+                        rub_amount_minor=amount_minor,
+                        method="platega",
+                        purpose=purpose,
+                        status="PENDING",
+                        reference=reference,
+                        external_payment_id=external_payment_id,
+                    )
+                elif (
+                    existing["payment_id"] != payment_id
+                    or int(existing["telegram_id"]) != telegram_id
+                    or int(existing["amount_paid_minor"]) != amount_minor
+                    or existing["external_payment_id"] != external_payment_id
+                    or existing["method"] != "platega"
+                ):
+                    raise WalletConflict("Pending payment record does not match")
+                connection.commit()
+        except sqlite3.Error as error:
+            raise WalletError("Cannot record pending payment") from error
+
+    def update_provider_payment_status(
+        self, external_payment_id: str, status: str
+    ) -> bool:
+        if status not in {"CONFIRMED", "CANCELED", "REFUNDING", "REFUNDED", "REVIEW"}:
+            raise ValueError("Invalid provider payment status")
+        try:
+            with closing(self._connect()) as connection:
+                changed = connection.execute(
+                    """
+                    UPDATE payment_transactions
+                    SET status = ?, updated_at = ?
+                    WHERE method = 'platega' AND external_payment_id = ?
+                      AND status != 'REFUNDED'
+                      AND (? != 'CANCELED' OR status IN ('PENDING', 'CANCELED'))
+                    """,
+                    (status, _now(), external_payment_id, status),
+                ).rowcount
+                connection.commit()
+            return changed == 1
+        except sqlite3.Error as error:
+            raise WalletError("Cannot update provider payment status") from error
+
     def complete_order_payment(self, order_id: str, *, status: str) -> None:
         if status not in {"SUCCESS", "REVIEW"}:
             raise ValueError("Invalid payment status")
         try:
             with closing(self._connect()) as connection:
-                connection.execute(
-                    """
-                    UPDATE payment_transactions
-                    SET status = ?, updated_at = ?
-                    WHERE reference = ? AND status = 'CONFIRMED'
-                    """,
-                    (status, _now(), f"order_payment:{order_id}"),
-                )
+                connection.execute("BEGIN IMMEDIATE")
+                self.complete_order_payment_locked(connection, order_id, status=status)
                 connection.commit()
         except sqlite3.Error as error:
             raise WalletError("Cannot update payment status") from error
+
+    @staticmethod
+    def complete_order_payment_locked(
+        connection: sqlite3.Connection, order_id: str, *, status: str = "SUCCESS"
+    ) -> None:
+        if status not in {"SUCCESS", "REVIEW"}:
+            raise ValueError("Invalid payment status")
+        changed = connection.execute(
+            """
+            UPDATE payment_transactions
+            SET status = ?, updated_at = ?
+            WHERE reference = ? AND status = 'CONFIRMED'
+            """,
+            (status, _now(), f"order_payment:{order_id}"),
+        ).rowcount
+        if changed != 1:
+            row = connection.execute(
+                "SELECT status FROM payment_transactions WHERE reference = ?",
+                (f"order_payment:{order_id}",),
+            ).fetchone()
+            if row is None or row["status"] != status:
+                raise WalletConflict("Payment is not awaiting completion")
 
     def record_order_payment(
         self,
@@ -677,6 +856,14 @@ class WalletStore:
                 or int(existing["amount_paid_minor"]) != amount_paid_minor
             ):
                 raise WalletConflict("Order payment record does not match")
+            if existing["status"] == "PENDING":
+                connection.execute(
+                    """
+                    UPDATE payment_transactions SET status = 'CONFIRMED', updated_at = ?
+                    WHERE reference = ? AND status = 'PENDING'
+                    """,
+                    (_now(), reference),
+                )
             return
         self._record_transaction_locked(
             connection,
@@ -709,7 +896,7 @@ class WalletStore:
             admin_telegram_id <= 0
             or mode not in {"fixed", "percent"}
             or value <= 0
-            or (mode == "fixed" and value > MAX_TOPUP_MINOR)
+            or (mode == "fixed" and value > MAX_MANUAL_BALANCE_MINOR)
             or (mode == "percent" and value > 100)
         ):
             raise ValueError("Invalid top-up bonus")
@@ -762,7 +949,7 @@ class WalletStore:
             or admin_telegram_id <= 0
             or telegram_id <= 0
             or amount_minor == 0
-            or abs(amount_minor) > MAX_TOPUP_MINOR
+            or abs(amount_minor) > MAX_MANUAL_BALANCE_MINOR
             or not reason.strip()
         ):
             raise ValueError("Invalid administrative balance change")
@@ -1040,12 +1227,19 @@ class WalletStore:
         stars_amount: int,
         *,
         now: str | None = None,
+        provider: str = "telegram_stars",
+        payment_method: int | None = None,
     ) -> Topup:
         if telegram_id <= 0:
             raise ValueError("Telegram ID must be positive")
-        if not MIN_TOPUP_MINOR <= amount_minor <= MAX_TOPUP_MINOR:
+        if (
+            isinstance(amount_minor, bool) or not isinstance(amount_minor, int)
+            or not MIN_TOPUP_MINOR <= amount_minor <= MAX_TOPUP_MINOR
+        ):
             raise ValueError("Top-up amount is out of range")
-        if not 1 <= stars_amount <= 10_000:
+        if provider not in {"telegram_stars", "platega"}:
+            raise ValueError("Unsupported top-up provider")
+        if provider == "telegram_stars" and not 1 <= stars_amount <= 10_000:
             raise ValueError("Top-up Stars amount is out of range")
         created_at = now or _now()
         topup = Topup(
@@ -1055,8 +1249,11 @@ class WalletStore:
             stars_amount=stars_amount,
             status=TOPUP_PENDING,
             provider_payment_id=None,
+            provider_payment_url=None,
             created_at=created_at,
             paid_at=None,
+            provider=provider,
+            provider_payment_method=payment_method,
         )
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1065,6 +1262,7 @@ class WalletStore:
                 UPDATE wallet_topups SET status = ?
                 WHERE telegram_id = ? AND status = ?
                   AND provider_payment_id IS NULL
+                  AND provider != 'platega'
                   AND datetime(created_at) <= datetime(?, '-30 minutes')
                 """,
                 (TOPUP_REFUNDED, telegram_id, TOPUP_PENDING, created_at),
@@ -1073,11 +1271,17 @@ class WalletStore:
                 """
                 SELECT * FROM wallet_topups
                 WHERE telegram_id = ? AND amount_minor = ? AND status = ?
-                  AND provider_payment_id IS NULL
+                  AND provider = ?
+                  AND provider_payment_method IS ?
+                  AND (provider_expires_at IS NULL OR datetime(provider_expires_at) > datetime(?))
+                  AND (provider != 'platega' OR provider_payment_id IS NULL OR provider_payment_url IS NOT NULL)
                   AND datetime(created_at) > datetime(?, '-30 minutes')
                 ORDER BY created_at DESC LIMIT 1
                 """,
-                (telegram_id, amount_minor, TOPUP_PENDING, created_at),
+                (
+                    telegram_id, amount_minor, TOPUP_PENDING, provider,
+                    payment_method, created_at, created_at,
+                ),
             ).fetchone()
             if existing is not None:
                 connection.commit()
@@ -1086,8 +1290,9 @@ class WalletStore:
                 """
                 INSERT INTO wallet_topups (
                     id, telegram_id, amount_minor, stars_amount,
-                    status, provider_payment_id, created_at, paid_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)
+                    status, provider_payment_id, created_at, paid_at, provider,
+                    provider_payment_method
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)
                 """,
                 (
                     topup.id,
@@ -1096,6 +1301,8 @@ class WalletStore:
                     topup.stars_amount,
                     topup.status,
                     topup.created_at,
+                    provider,
+                    payment_method,
                 ),
             )
             connection.commit()
@@ -1118,6 +1325,41 @@ class WalletStore:
             ).fetchone()
         return None if row is None else _topup(row)
 
+    def save_topup_payment_link(
+        self, topup_id: str, payment_id: str, payment_url: str | None = None,
+        *, expires_at: str | None = None,
+    ) -> Topup:
+        if not payment_id or (payment_url is not None and not payment_url):
+            raise ValueError("Payment ID and URL are required")
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                changed = connection.execute(
+                    """
+                    UPDATE wallet_topups
+                    SET provider_payment_id = ?, provider_payment_url = ?, provider_expires_at = ?
+                    WHERE id = ? AND provider = 'platega' AND status = ?
+                      AND provider_payment_id IS NULL
+                    """,
+                    (payment_id, payment_url, expires_at, topup_id, TOPUP_PENDING),
+                ).rowcount
+                row = connection.execute(
+                    "SELECT * FROM wallet_topups WHERE id = ?", (topup_id,)
+                ).fetchone()
+                if row is None:
+                    raise TopupNotFound(topup_id)
+                if changed != 1 and (
+                    row["provider"] != "platega"
+                    or row["status"] != TOPUP_PENDING
+                    or row["provider_payment_id"] != payment_id
+                    or row["provider_payment_url"] != payment_url
+                ):
+                    raise TopupConflict("Payment link cannot be saved")
+                connection.commit()
+                return _topup(row)
+        except sqlite3.Error as error:
+            raise WalletError("Cannot save top-up payment link") from error
+
     def topup_bonus_minor(self, topup_id: str) -> int:
         try:
             with closing(self._connect()) as connection:
@@ -1136,6 +1378,7 @@ class WalletStore:
         provider_payment_id: str,
         amount_minor: int,
         currency: str,
+        provider: str = "telegram_stars",
     ) -> tuple[Topup, bool, ReferralReward | None]:
         if not provider_payment_id:
             raise ValueError("Provider payment ID is required")
@@ -1148,6 +1391,8 @@ class WalletStore:
                 if row is None:
                     raise TopupNotFound(topup_id)
                 topup = _topup(row)
+                if topup.provider != provider:
+                    raise TopupConflict("Top-up provider does not match")
                 if topup.provider_payment_id is not None:
                     if (
                         topup.provider_payment_id == provider_payment_id
@@ -1155,10 +1400,16 @@ class WalletStore:
                     ):
                         connection.commit()
                         return topup, False, None
-                    raise TopupConflict("Top-up already has another payment")
-                if topup.status != TOPUP_PENDING:
+                    if (
+                        topup.provider_payment_id != provider_payment_id
+                        or (topup.status != TOPUP_PENDING and not (provider == "platega" and topup.status == "CANCELED"))
+                    ):
+                        raise TopupConflict("Top-up already has another payment")
+                if topup.status != TOPUP_PENDING and not (provider == "platega" and topup.status == "CANCELED"):
                     raise TopupConflict("Top-up is no longer pending")
-                if currency.upper() != "XTR" or amount_minor != topup.stars_amount:
+                expected_currency = "RUB" if provider == "platega" else "XTR"
+                expected_amount = topup.amount_minor if provider == "platega" else topup.stars_amount
+                if currency.upper() != expected_currency or amount_minor != expected_amount:
                     raise TopupConflict("Top-up payment details do not match")
                 paid_at = _now()
                 connection.execute(
@@ -1172,7 +1423,7 @@ class WalletStore:
                         provider_payment_id,
                         paid_at,
                         topup.id,
-                        TOPUP_PENDING,
+                        topup.status,
                     ),
                 )
                 self._credit_locked(
@@ -1229,19 +1480,45 @@ class WalletStore:
                         status="SUCCESS",
                         reference=f"topup_bonus:{topup.id}",
                     )
-                self._record_transaction_locked(
-                    connection,
-                    payment_id=topup.id,
-                    telegram_id=topup.telegram_id,
-                    amount_paid_minor=amount_minor,
-                    currency=currency,
-                    rub_amount_minor=topup.amount_minor,
-                    method="telegram_stars",
-                    purpose="topup",
-                    status="SUCCESS",
-                    reference=f"topup_payment:{topup.id}",
-                    external_payment_id=provider_payment_id,
-                )
+                pending_transaction = connection.execute(
+                    "SELECT * FROM payment_transactions WHERE reference = ?",
+                    (f"topup_payment:{topup.id}",),
+                ).fetchone()
+                if pending_transaction is None:
+                    self._record_transaction_locked(
+                        connection,
+                        payment_id=topup.id,
+                        telegram_id=topup.telegram_id,
+                        amount_paid_minor=amount_minor,
+                        currency=currency,
+                        rub_amount_minor=topup.amount_minor,
+                        method=provider,
+                        purpose="topup",
+                        status="SUCCESS",
+                        reference=f"topup_payment:{topup.id}",
+                        external_payment_id=provider_payment_id,
+                    )
+                else:
+                    if (
+                        pending_transaction["external_payment_id"] != provider_payment_id
+                        or pending_transaction["method"] != provider
+                        or int(pending_transaction["telegram_id"]) != topup.telegram_id
+                        or int(pending_transaction["rub_amount_minor"]) != topup.amount_minor
+                    ):
+                        raise TopupConflict("Payment history does not match top-up")
+                    connection.execute(
+                        """
+                        UPDATE payment_transactions SET status = 'SUCCESS',
+                            amount_paid_minor = ?, currency = ?, updated_at = ?
+                        WHERE reference = ?
+                        """,
+                        (
+                            amount_minor,
+                            currency.upper(),
+                            paid_at,
+                            f"topup_payment:{topup.id}",
+                        ),
+                    )
                 reward = self._reward_referral_locked(
                     connection,
                     referred_id=topup.telegram_id,
@@ -1272,7 +1549,18 @@ class WalletStore:
                 if topup.status == TOPUP_REFUNDED:
                     connection.commit()
                     return False
-                if topup.status != TOPUP_CREDITED:
+                if topup.provider == "platega" and topup.status in {TOPUP_PENDING, "CANCELED"}:
+                    connection.execute(
+                        "UPDATE wallet_topups SET status = ? WHERE id = ?",
+                        (TOPUP_REFUNDED, topup.id),
+                    )
+                    connection.execute(
+                        "UPDATE payment_transactions SET status = 'REFUNDED', updated_at = ? WHERE reference = ?",
+                        (_now(), f"topup_payment:{topup.id}"),
+                    )
+                    connection.commit()
+                    return True
+                if topup.status not in {TOPUP_CREDITED, "REFUNDING"}:
                     connection.commit()
                     return False
                 account = self._ensure_account_locked(
@@ -1357,6 +1645,62 @@ class WalletStore:
                 return True
         except sqlite3.Error as error:
             raise WalletError("Cannot refund top-up") from error
+
+    def claim_topup_refund(self, topup_id: str) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                changed = connection.execute(
+                    """
+                    UPDATE wallet_topups SET status = 'REFUNDING'
+                    WHERE id = ? AND provider = 'platega' AND status = ?
+                    """,
+                    (topup_id, TOPUP_CREDITED),
+                ).rowcount
+                connection.commit()
+            return changed == 1
+        except sqlite3.Error as error:
+            raise WalletError("Cannot claim top-up refund") from error
+
+    def release_topup_refund(self, topup_id: str) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                changed = connection.execute(
+                    """
+                    UPDATE wallet_topups SET status = ?
+                    WHERE id = ? AND status = 'REFUNDING'
+                    """,
+                    (TOPUP_CREDITED, topup_id),
+                ).rowcount
+                connection.commit()
+            return changed == 1
+        except sqlite3.Error as error:
+            raise WalletError("Cannot release top-up refund") from error
+
+    def cancel_topup(self, topup_id: str) -> bool:
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                changed = connection.execute(
+                    """
+                    UPDATE wallet_topups SET status = 'CANCELED'
+                    WHERE id = ? AND status = ? AND provider_payment_id IS NOT NULL
+                    """,
+                    (topup_id, TOPUP_PENDING),
+                ).rowcount
+                if changed == 1:
+                    connection.execute(
+                        """
+                        UPDATE payment_transactions SET status = 'CANCELED',
+                            updated_at = ?
+                        WHERE reference = ? AND status = 'PENDING'
+                        """,
+                        (_now(), f"topup_payment:{topup_id}"),
+                    )
+                connection.commit()
+            return changed == 1
+        except sqlite3.Error as error:
+            raise WalletError("Cannot cancel top-up") from error
 
     def _reward_referral_locked(
         self,
@@ -1572,7 +1916,10 @@ class WalletStore:
                     "FULFILLED",
                     "FULFILLMENT_REVIEW",
                     "PAID",
-                }:
+                } and not (
+                    order["provider"] == "platega"
+                    and order["status"] in {"PENDING", "CANCELLED"}
+                ):
                     raise WalletConflict("Order cannot be refunded")
                 connection.execute(
                     "UPDATE orders SET status = 'REFUNDED' WHERE id = ?",

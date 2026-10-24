@@ -10,7 +10,11 @@ import sys
 import time
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from hashlib import sha256
 from html import escape
+from pathlib import Path
+from urllib.parse import urlsplit
+from uuid import UUID
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
@@ -18,6 +22,7 @@ from aiogram.exceptions import (
     TelegramAPIError,
     TelegramBadRequest,
     TelegramForbiddenError,
+    TelegramRetryAfter,
 )
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -28,6 +33,7 @@ from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
     ErrorEvent,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
@@ -35,6 +41,7 @@ from aiogram.types import (
     PreCheckoutQuery,
 )
 from aiogram.utils.token import TokenValidationError
+from aiohttp import web
 
 from jopesvpn.admin import (
     admin_disable,
@@ -59,6 +66,7 @@ from jopesvpn.announcements import (
     image_prompt_keyboard,
     preview_keyboard,
 )
+from jopesvpn.broadcasts import BroadcastError, BroadcastStore
 from jopesvpn.config import ConfigurationError, Settings
 from jopesvpn.connection_logs import connection_log_loop
 from jopesvpn.free_access import free_access_loop
@@ -93,6 +101,7 @@ from jopesvpn.panel import (
     PanelUser,
     RemnawaveClient,
 )
+from jopesvpn.payments import PaymentCheck, PaymentStore
 from jopesvpn.plans import (
     Plan,
     PlanTerm,
@@ -101,7 +110,27 @@ from jopesvpn.plans import (
     stars_for_rub_amount,
     term_savings,
 )
+from jopesvpn.platega import (
+    PlategaClient,
+    PlategaError,
+    PlategaProtocolError,
+    TransactionStatus,
+)
 from jopesvpn.preferences import PreferencesError, PreferencesStore
+from jopesvpn.promotions import (
+    PROMO_MAX_EXTRA_BUTTONS,
+    PROMO_NEW_DAYS,
+    PROMO_POST_TEXT,
+    PROMO_RETURNING_DAYS,
+    PROMO_START_PREFIX,
+    PromotionStore,
+    PromotionStoreError,
+    promo_builder_buttons_keyboard,
+    promo_builder_photo_keyboard,
+    promo_builder_text_keyboard,
+    promo_preview_keyboard,
+    promo_review_photo_keyboard,
+)
 from jopesvpn.screens import answer_screen, edit_screen
 from jopesvpn.screens import configure as configure_screens
 from jopesvpn.ticket_ui import (
@@ -118,7 +147,7 @@ from jopesvpn.ticket_ui import (
     ticket_list_keyboard,
     ticket_list_text,
 )
-from jopesvpn.tickets import TicketStore, TicketStoreError
+from jopesvpn.tickets import TicketRateLimited, TicketStore, TicketStoreError
 from jopesvpn.timezones import (
     ADMIN_UTC_OFFSET,
     DEFAULT_UTC_OFFSET,
@@ -161,11 +190,13 @@ from jopesvpn.ui import (
     more_keyboard,
     more_text,
     no_subscription_text,
+    payment_method_text,
     payment_methods_keyboard,
     payment_receipt_text,
     plan_terms_keyboard,
     plans_keyboard,
     plans_text,
+    platega_payment_keyboard,
     referral_keyboard,
     referral_share_url,
     referral_text,
@@ -195,8 +226,10 @@ from jopesvpn.ui import (
     withdrawal_text,
 )
 from jopesvpn.wallet import (
+    MAX_TOPUP_MINOR,
     MIN_TOPUP_MINOR,
     MIN_WITHDRAWAL_MINOR,
+    TOPUP_PRESET_AMOUNTS,
     InsufficientFunds,
     PaymentTransaction,
     TopupConflict,
@@ -210,12 +243,22 @@ from jopesvpn.wallet import (
 
 logger = logging.getLogger(__name__)
 router = Router(name="user")
-BUILD_CODE = "JV-FREEWALLET-R4"
+BUILD_CODE = "JV-PAYMENTS-R6"
 PROCESS_STARTED_AT = time.monotonic()
 
 
 class AnnouncementFlow(StatesGroup):
     awaiting_image = State()
+
+
+class PromoPostFlow(StatesGroup):
+    choosing_text = State()
+    configuring_buttons = State()
+    awaiting_text = State()
+    awaiting_photo = State()
+    awaiting_button_label = State()
+    awaiting_button_url = State()
+    awaiting_review_photo = State()
 
 
 @router.message(
@@ -254,13 +297,19 @@ async def user_section_command_entry(
 
 
 @router.message(Command("ping"))
-async def ping_command(message: Message) -> None:
+async def ping_command(message: Message, bot: Bot) -> None:
+    api_started_at = time.perf_counter()
+    await bot.get_me()
+    api_latency_ms = max(0, round((time.perf_counter() - api_started_at) * 1000))
     uptime_seconds = max(0, int(time.monotonic() - PROCESS_STARTED_AT))
     days, remainder = divmod(uptime_seconds, 86_400)
     hours, remainder = divmod(remainder, 3_600)
     minutes, seconds = divmod(remainder, 60)
     await message.answer(
-        f"{BUILD_CODE} · uptime {days}d {hours:02}:{minutes:02}:{seconds:02}"
+        "🏓 Pong\n"
+        f"Сборка: {BUILD_CODE}\n"
+        f"Telegram API: {api_latency_ms} мс\n"
+        f"Uptime: {days}д {hours:02}:{minutes:02}:{seconds:02}"
     )
 
 
@@ -484,7 +533,16 @@ def _channel_post_keyboard(
     bot_username: str,
     *,
     approval: bool,
+    post_type: str = "standard",
 ) -> InlineKeyboardMarkup:
+    flat_buttons = [button for row in buttons for button in row]
+    if post_type == "promo":
+        return promo_preview_keyboard(
+            post_id,
+            bot_username,
+            flat_buttons,
+            approval=approval,
+        )
     markup = []
     button_index = 0
     for row in buttons:
@@ -504,12 +562,21 @@ def _channel_post_keyboard(
         markup.append(
             [
                 InlineKeyboardButton(
-                    text="Опубликовать",
+                    text="Добавить фото",
+                    callback_data=f"channelpost:{post_id}:photo",
+                    style="primary",
+                )
+            ]
+        )
+        markup.append(
+            [
+                InlineKeyboardButton(
+                    text="Опубликовать в ТГК",
                     callback_data=f"channelpost:{post_id}:approve",
                     style="success",
                 ),
                 InlineKeyboardButton(
-                    text="Отмена",
+                    text="Отклонить",
                     callback_data=f"channelpost:{post_id}:cancel",
                     style="danger",
                 ),
@@ -518,7 +585,11 @@ def _channel_post_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=markup)
 
 
-async def channel_post_preview_loop(bot: Bot, tickets: TicketStore) -> None:
+async def channel_post_preview_loop(
+    bot: Bot,
+    tickets: TicketStore,
+    promotions: PromotionStore | None = None,
+) -> None:
     try:
         recovered = tickets.recover_channel_post_previews()
         if recovered:
@@ -538,14 +609,27 @@ async def channel_post_preview_loop(bot: Bot, tickets: TicketStore) -> None:
                 post_id = int(post["post_id"])
                 if not tickets.claim_channel_post_preview(post_id):
                     continue
+                reviewer_id = int(post["reviewer_id"] or post["owner_id"])
                 try:
                     buttons = json.loads(post["buttons_json"])
                     markup = _channel_post_keyboard(
-                        post_id, buttons, bot_username, approval=True
+                        post_id,
+                        buttons,
+                        bot_username,
+                        approval=True,
+                        post_type=str(post["post_type"]),
                     )
-                    if post["photo_data"] is not None:
+                    if post["photo_file_id"] is not None:
                         posted = await bot.send_photo(
-                            chat_id=int(post["owner_id"]),
+                            chat_id=reviewer_id,
+                            photo=post["photo_file_id"],
+                            caption=post["body_html"] or None,
+                            parse_mode="HTML" if post["body_html"] else None,
+                            reply_markup=markup,
+                        )
+                    elif post["photo_data"] is not None:
+                        posted = await bot.send_photo(
+                            chat_id=reviewer_id,
                             photo=BufferedInputFile(
                                 bytes(post["photo_data"]),
                                 filename={
@@ -560,19 +644,63 @@ async def channel_post_preview_loop(bot: Bot, tickets: TicketStore) -> None:
                         )
                     else:
                         posted = await bot.send_message(
-                            chat_id=int(post["owner_id"]),
+                            chat_id=reviewer_id,
                             text=post["body_html"],
                             parse_mode="HTML",
                             reply_markup=markup,
                         )
                     tickets.finish_channel_post_preview(post_id, posted.message_id)
-                except (TelegramAPIError, TicketStoreError, ValueError, TypeError):
+                    if post["post_type"] == "promo":
+                        logs = (
+                            promotions.preparation_log(post_id)
+                            if promotions is not None
+                            else []
+                        )
+                        log_text = "\n".join(
+                            f"{entry['created_at']} · ID {entry['actor_id']} · "
+                            f"{entry['action']}: {entry['detail']}"
+                            for entry in logs
+                        ) or "Нет записей"
+                        try:
+                            await bot.send_message(
+                                chat_id=reviewer_id,
+                                text=t(
+                                    "promo.review_details",
+                                    post_id=post_id,
+                                    creator_id=post["owner_id"],
+                                    creator=f"ID {post['owner_id']}",
+                                    photo=(
+                                        "есть"
+                                        if post["photo_file_id"] is not None
+                                        or post["photo_data"] is not None
+                                        else "нет"
+                                    ),
+                                    log=escape(log_text),
+                                ),
+                                parse_mode="HTML",
+                            )
+                        except TelegramAPIError:
+                            logger.exception(
+                                "Promotion review details could not be delivered"
+                            )
+                except (
+                    TelegramAPIError,
+                    TicketStoreError,
+                    PromotionStoreError,
+                    ValueError,
+                    TypeError,
+                ):
                     logger.exception("Channel post preview delivery failed")
                     try:
                         tickets.retry_channel_post_preview(post_id)
                     except TicketStoreError:
                         logger.exception("Channel post preview retry could not be saved")
-        except (TelegramAPIError, TicketStoreError, RuntimeError):
+        except (
+            TelegramAPIError,
+            TicketStoreError,
+            PromotionStoreError,
+            RuntimeError,
+        ):
             logger.exception("Channel post queue could not be processed")
         await asyncio.sleep(5)
 
@@ -583,9 +711,12 @@ async def channel_post_approval(
     bot: Bot,
     settings: Settings,
     tickets: TicketStore,
+    state: FSMContext | None = None,
+    promotions: PromotionStore | None = None,
 ) -> None:
     match = re.fullmatch(
-        r"channelpost:([1-9][0-9]{0,18}):(approve|cancel)", callback.data or ""
+        r"channelpost:([1-9][0-9]{0,18}):(approve|cancel|photo|photo_cancel)",
+        callback.data or "",
     )
     if match is None:
         await callback.answer("Кнопка устарела.", show_alert=True)
@@ -595,7 +726,46 @@ async def channel_post_approval(
     if callback.from_user.id != owner_id:
         await callback.answer("Одобрить пост может только владелец.", show_alert=True)
         return
-    if match.group(2) == "cancel":
+    action = match.group(2)
+    if action == "photo_cancel":
+        if state is not None and (await state.get_data()).get("post_id") == post_id:
+            await state.clear()
+        await callback.answer("Загрузка фото отменена.")
+        return
+    if action == "photo":
+        if state is None:
+            await callback.answer("Загрузка фото недоступна.", show_alert=True)
+            return
+        try:
+            post = tickets.get_channel_post(post_id)
+        except TicketStoreError:
+            logger.exception("Channel post image request could not be loaded")
+            await callback.answer("Не удалось открыть загрузку фото.", show_alert=True)
+            return
+        if (
+            post is None
+            or post["status"] != "awaiting_approval"
+            or int(post["reviewer_id"] or post["owner_id"]) != owner_id
+        ):
+            await callback.answer("Этот пост уже обработан.", show_alert=True)
+            return
+        await state.clear()
+        await state.update_data(post_id=post_id)
+        await state.set_state(PromoPostFlow.awaiting_review_photo)
+        try:
+            await bot.send_message(
+                owner_id,
+                t("promo.builder.review_photo_prompt"),
+                reply_markup=promo_review_photo_keyboard(post_id),
+            )
+        except TelegramAPIError:
+            await state.clear()
+            logger.exception("Promotion photo upload prompt could not be sent")
+            await callback.answer("Не удалось запросить фото.", show_alert=True)
+            return
+        await callback.answer()
+        return
+    if action == "cancel":
         try:
             cancelled = tickets.cancel_channel_post(post_id, owner_id)
         except TicketStoreError:
@@ -605,6 +775,14 @@ async def channel_post_approval(
         if not cancelled:
             await callback.answer("Пост уже обработан.", show_alert=True)
             return
+        try:
+            post = tickets.get_channel_post(post_id)
+            if post is not None and post["post_type"] == "promo":
+                if promotions is None:
+                    raise PromotionStoreError("Promotion storage is unavailable")
+                promotions.cancel_campaign(post_id)
+        except (TicketStoreError, PromotionStoreError):
+            logger.exception("Promotion cancellation state could not be saved")
         await callback.answer("Пост отменён.")
         if isinstance(callback.message, Message):
             await callback.message.edit_reply_markup(reply_markup=None)
@@ -621,7 +799,11 @@ async def channel_post_approval(
             raise RuntimeError("Channel post data is unavailable")
         buttons = json.loads(post["buttons_json"])
         markup = _channel_post_keyboard(
-            post_id, buttons, bot_user.username, approval=False
+            post_id,
+            buttons,
+            bot_user.username,
+            approval=False,
+            post_type=str(post["post_type"]),
         )
     except (TelegramAPIError, TicketStoreError, RuntimeError, ValueError, TypeError):
         if claimed:
@@ -633,7 +815,15 @@ async def channel_post_approval(
         await callback.answer("Не удалось подготовить пост.", show_alert=True)
         return
     try:
-        if post["photo_data"] is not None:
+        if post["photo_file_id"] is not None:
+            published = await bot.send_photo(
+                chat_id=f"@{settings.trial_channel_username}",
+                photo=post["photo_file_id"],
+                caption=post["body_html"] or None,
+                parse_mode="HTML" if post["body_html"] else None,
+                reply_markup=markup if buttons or post["post_type"] == "promo" else None,
+            )
+        elif post["photo_data"] is not None:
             published = await bot.send_photo(
                 chat_id=f"@{settings.trial_channel_username}",
                 photo=BufferedInputFile(
@@ -646,14 +836,14 @@ async def channel_post_approval(
                 ),
                 caption=post["body_html"] or None,
                 parse_mode="HTML" if post["body_html"] else None,
-                reply_markup=markup if buttons else None,
+                reply_markup=markup if buttons or post["post_type"] == "promo" else None,
             )
         else:
             published = await bot.send_message(
                 chat_id=f"@{settings.trial_channel_username}",
                 text=post["body_html"],
                 parse_mode="HTML",
-                reply_markup=markup if buttons else None,
+                reply_markup=markup if buttons or post["post_type"] == "promo" else None,
             )
     except (TelegramBadRequest, TelegramForbiddenError):
         try:
@@ -674,11 +864,17 @@ async def channel_post_approval(
         )
         return
     try:
-        if not tickets.finish_channel_post_publication(
-            post_id, published.message_id
-        ):
+        if post["post_type"] == "promo":
+            if promotions is None:
+                raise PromotionStoreError("Promotion storage is unavailable")
+            finished = promotions.finish_publication(post_id, published.message_id)
+        else:
+            finished = tickets.finish_channel_post_publication(
+                post_id, published.message_id
+            )
+        if not finished:
             raise TicketStoreError("Published post status could not be saved")
-    except TicketStoreError:
+    except (PromotionStoreError, TicketStoreError):
         logger.exception("Published channel post status could not be saved")
         await callback.answer(
             "Пост отправлен, но статус не сохранился. Не нажимайте повторно.",
@@ -688,6 +884,462 @@ async def channel_post_approval(
     await callback.answer("Пост опубликован.")
     if isinstance(callback.message, Message):
         await callback.message.edit_reply_markup(reply_markup=None)
+
+
+def _promo_builder_allowed(callback: CallbackQuery, settings: Settings) -> bool:
+    return (
+        isinstance(callback.message, Message)
+        and callback.message.chat.type == "private"
+        and callback.from_user.id in settings.admin_telegram_ids
+    )
+
+
+def _promo_builder_buttons(data: dict[str, object]) -> list[dict[str, str]]:
+    raw_buttons = data.get("buttons", [])
+    if not isinstance(raw_buttons, list):
+        return []
+    return [
+        button
+        for button in raw_buttons
+        if isinstance(button, dict)
+        and isinstance(button.get("text"), str)
+        and isinstance(button.get("url"), str)
+    ]
+
+
+async def _send_promo_builder_preview(
+    bot: Bot, chat_id: int, data: dict[str, object]
+) -> None:
+    bot_user = await bot.get_me()
+    text = data.get("text")
+    if not bot_user.username or not isinstance(text, str) or not text.strip():
+        raise ValueError("Promo preview data is incomplete")
+    keyboard = promo_preview_keyboard(
+        None, bot_user.username, _promo_builder_buttons(data)
+    )
+    photo_file_id = data.get("photo_file_id")
+    if isinstance(photo_file_id, str):
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=photo_file_id,
+            caption=text,
+            reply_markup=keyboard,
+        )
+    else:
+        await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("promo-builder:"))
+async def promo_post_builder_callback(
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    state: FSMContext,
+    tickets: TicketStore,
+    promotions: PromotionStore,
+) -> None:
+    if not _promo_builder_allowed(callback, settings):
+        await callback.answer(t("admin.command_unavailable"), show_alert=True)
+        return
+    assert isinstance(callback.message, Message)
+    action = (callback.data or "").removeprefix("promo-builder:")
+    if action == "start":
+        await state.clear()
+        await state.update_data(actor_id=callback.from_user.id, buttons=[], preparation=[])
+        await state.set_state(PromoPostFlow.choosing_text)
+        await callback.answer()
+        await callback.message.answer(
+            t("promo.builder.choose_text", body=escape(PROMO_POST_TEXT)),
+            reply_markup=promo_builder_text_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+    data = await state.get_data()
+    if data.get("actor_id") != callback.from_user.id:
+        await callback.answer(
+            "Черновик не найден. Начните создание заново.", show_alert=True
+        )
+        return
+    if action == "cancel":
+        await state.clear()
+        await callback.answer(t("promo.builder.cancelled"))
+        await callback.message.answer(t("promo.builder.cancelled"))
+        return
+    if action == "text:default":
+        await state.update_data(text=PROMO_POST_TEXT)
+        await state.set_state(PromoPostFlow.awaiting_photo)
+        await callback.answer()
+        await callback.message.answer(
+            t("promo.builder.photo_prompt"),
+            reply_markup=promo_builder_photo_keyboard(),
+        )
+        return
+    if action == "text:edit":
+        await state.set_state(PromoPostFlow.awaiting_text)
+        await callback.answer()
+        await callback.message.answer(t("promo.builder.edit_text"))
+        return
+    if action in {"photo:skip", "photo:replace"}:
+        if "text" not in data:
+            await callback.answer("Сначала задайте текст.", show_alert=True)
+            return
+        preparation = list(data.get("preparation", []))
+        if action == "photo:skip":
+            await state.update_data(photo_file_id=None)
+            preparation.append({"action": "photo", "detail": "не добавлено"})
+            await state.set_state(PromoPostFlow.configuring_buttons)
+        else:
+            preparation.append({"action": "photo", "detail": "запрошена замена"})
+            await state.set_state(PromoPostFlow.awaiting_photo)
+        await state.update_data(preparation=preparation)
+        await callback.answer()
+        if action == "photo:skip":
+            await callback.message.answer(
+                t("promo.builder.buttons_prompt"),
+                reply_markup=promo_builder_buttons_keyboard(
+                    len(_promo_builder_buttons(data))
+                ),
+            )
+        else:
+            await callback.message.answer(
+                t("promo.builder.photo_prompt"),
+                reply_markup=promo_builder_photo_keyboard(),
+            )
+        return
+    if action == "button:add":
+        if len(_promo_builder_buttons(data)) >= PROMO_MAX_EXTRA_BUTTONS:
+            await callback.answer("Достигнут лимит дополнительных кнопок.", show_alert=True)
+            return
+        await state.set_state(PromoPostFlow.awaiting_button_label)
+        await callback.answer()
+        await callback.message.answer(t("promo.builder.button_label"))
+        return
+    if action == "preview":
+        try:
+            await _send_promo_builder_preview(bot, callback.from_user.id, data)
+        except (TelegramAPIError, ValueError):
+            logger.exception("Promo post preview could not be sent")
+            await callback.answer("Не удалось показать предпросмотр.", show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.answer(
+            t("promo.builder.controls"),
+            reply_markup=promo_builder_buttons_keyboard(
+                len(_promo_builder_buttons(data))
+            ),
+        )
+        return
+    if action == "submit":
+        text = data.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 1024:
+            await callback.answer(t("promo.builder.text_invalid"), show_alert=True)
+            return
+        post_id: int | None = None
+        try:
+            post_id = tickets.create_channel_post(
+                callback.from_user.id,
+                escape(text.strip()),
+                [[button] for button in _promo_builder_buttons(data)],
+                None,
+                None,
+                reviewer_id=_announcement_owner_id(settings),
+                photo_file_id=(
+                    data.get("photo_file_id")
+                    if isinstance(data.get("photo_file_id"), str)
+                    else None
+                ),
+                post_type="promo",
+            )
+            promotions.create_campaign(post_id)
+            preparations = data.get("preparation", [])
+            promotions.log_preparation(
+                post_id,
+                callback.from_user.id,
+                "created",
+                f"creator={callback.from_user.full_name}",
+            )
+            for entry in preparations if isinstance(preparations, list) else []:
+                if isinstance(entry, dict):
+                    promotions.log_preparation(
+                        post_id,
+                        callback.from_user.id,
+                        str(entry.get("action", "update")),
+                        str(entry.get("detail", "")),
+                    )
+            promotions.log_preparation(
+                post_id,
+                callback.from_user.id,
+                "sent_for_approval",
+                f"buttons={len(_promo_builder_buttons(data)) + 1}",
+            )
+        except (TicketStoreError, PromotionStoreError, ValueError):
+            logger.exception("Promo post could not be submitted for approval")
+            if post_id is not None:
+                try:
+                    tickets.cancel_queued_promo_post(
+                        post_id, callback.from_user.id
+                    )
+                    promotions.cancel_campaign(post_id)
+                except (TicketStoreError, PromotionStoreError):
+                    logger.exception("Incomplete promo post could not be cancelled")
+            await callback.answer(t("promo.builder.unavailable"), show_alert=True)
+            return
+        await state.clear()
+        await callback.answer()
+        await callback.message.answer(t("promo.builder.submitted"))
+        return
+    await callback.answer("Кнопка устарела.", show_alert=True)
+
+
+@router.message(PromoPostFlow.awaiting_text, F.text)
+async def receive_promo_post_text(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if not _private_chat(message) or not _is_admin(message, settings):
+        await state.clear()
+        await message.answer(t("admin.command_unavailable"))
+        return
+    text = (message.text or "").strip()
+    if text.casefold() in {"/cancel", "отмена"}:
+        await state.clear()
+        await message.answer(t("promo.builder.cancelled"))
+        return
+    if not text or len(text) > 1024:
+        await message.answer(t("promo.builder.text_invalid"))
+        return
+    data = await state.get_data()
+    preparation = list(data.get("preparation", []))
+    preparation.append({"action": "text", "detail": "изменён администратором"})
+    await state.update_data(text=text, preparation=preparation)
+    await state.set_state(PromoPostFlow.awaiting_photo)
+    await message.answer(
+        t("promo.builder.photo_prompt"),
+        reply_markup=promo_builder_photo_keyboard(),
+    )
+
+
+@router.message(PromoPostFlow.awaiting_photo, F.photo)
+async def receive_promo_post_photo(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if not _private_chat(message) or not _is_admin(message, settings):
+        await state.clear()
+        await message.answer(t("admin.command_unavailable"))
+        return
+    assert message.from_user is not None
+    data = await state.get_data()
+    if data.get("actor_id") != message.from_user.id:
+        await state.clear()
+        await message.answer(t("promo.builder.cancelled"))
+        return
+    assert message.photo is not None
+    preparation = list(data.get("preparation", []))
+    preparation.append({"action": "photo", "detail": "добавлено администратором"})
+    await state.update_data(
+        photo_file_id=message.photo[-1].file_id,
+        preparation=preparation,
+    )
+    await state.set_state(PromoPostFlow.configuring_buttons)
+    await message.answer(t("promo.builder.photo_saved"))
+    await message.answer(
+        t("promo.builder.buttons_prompt"),
+        reply_markup=promo_builder_buttons_keyboard(
+            len(_promo_builder_buttons(data))
+        ),
+    )
+
+
+@router.message(PromoPostFlow.awaiting_button_label, F.text)
+async def receive_promo_post_button_label(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if not _private_chat(message) or not _is_admin(message, settings):
+        await state.clear()
+        await message.answer(t("admin.command_unavailable"))
+        return
+    label = (message.text or "").strip()
+    if label.casefold() in {"/cancel", "отмена"}:
+        await state.set_state(PromoPostFlow.configuring_buttons)
+        await message.answer(
+            t("promo.builder.buttons_prompt"),
+            reply_markup=promo_builder_buttons_keyboard(0),
+        )
+        return
+    if not label or len(label) > 64:
+        await message.answer(t("promo.builder.button_label"))
+        return
+    await state.update_data(pending_button_label=label)
+    await state.set_state(PromoPostFlow.awaiting_button_url)
+    await message.answer(t("promo.builder.button_url"))
+
+
+@router.message(PromoPostFlow.awaiting_button_url, F.text)
+async def receive_promo_post_button_url(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if not _private_chat(message) or not _is_admin(message, settings):
+        await state.clear()
+        await message.answer(t("admin.command_unavailable"))
+        return
+    url = (message.text or "").strip()
+    if url.casefold() in {"/cancel", "отмена"}:
+        await state.set_state(PromoPostFlow.configuring_buttons)
+        await message.answer(
+            t("promo.builder.buttons_prompt"),
+            reply_markup=promo_builder_buttons_keyboard(0),
+        )
+        return
+    try:
+        parsed = urlsplit(url)
+        parsed_port = parsed.port
+    except ValueError:
+        await message.answer(t("promo.builder.button_invalid"))
+        return
+    if (
+        len(url) > 512
+        or parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed_port == 0
+        or any(character.isspace() for character in url)
+    ):
+        await message.answer(t("promo.builder.button_invalid"))
+        return
+    data = await state.get_data()
+    buttons = _promo_builder_buttons(data)
+    if len(buttons) >= PROMO_MAX_EXTRA_BUTTONS:
+        await state.set_state(PromoPostFlow.configuring_buttons)
+        await message.answer("Достигнут лимит дополнительных кнопок.")
+        return
+    label = data.get("pending_button_label")
+    if not isinstance(label, str):
+        await state.set_state(PromoPostFlow.configuring_buttons)
+        await message.answer(t("promo.builder.button_invalid"))
+        return
+    buttons.append({"text": label, "url": url})
+    preparation = list(data.get("preparation", []))
+    preparation.append(
+        {"action": "button_added", "detail": f"{label} · {parsed.hostname}"}
+    )
+    await state.update_data(
+        buttons=buttons,
+        preparation=preparation,
+        pending_button_label=None,
+    )
+    await state.set_state(PromoPostFlow.configuring_buttons)
+    await message.answer(
+        t("promo.builder.controls"),
+        reply_markup=promo_builder_buttons_keyboard(len(buttons)),
+    )
+
+
+@router.message(PromoPostFlow.awaiting_review_photo, F.photo)
+async def receive_review_post_photo(
+    message: Message,
+    bot: Bot,
+    settings: Settings,
+    state: FSMContext,
+    tickets: TicketStore,
+    promotions: PromotionStore,
+) -> None:
+    owner_id = _announcement_owner_id(settings)
+    if not _private_chat(message) or message.from_user is None:
+        await state.clear()
+        return
+    if message.from_user.id != owner_id:
+        await state.clear()
+        await message.answer(t("admin.command_unavailable"))
+        return
+    data = await state.get_data()
+    post_id = data.get("post_id")
+    if not isinstance(post_id, int):
+        await state.clear()
+        await message.answer(t("promo.builder.review_photo_expired"))
+        return
+    new_preview_id: int | None = None
+    try:
+        post = tickets.get_channel_post(post_id)
+        bot_user = await bot.get_me()
+        if post is None or post["status"] != "awaiting_approval":
+            raise TicketStoreError("Post is no longer awaiting approval")
+        if not bot_user.username:
+            raise RuntimeError("Bot username is unavailable")
+        markup = _channel_post_keyboard(
+            post_id,
+            json.loads(post["buttons_json"]),
+            bot_user.username,
+            approval=True,
+            post_type=str(post["post_type"]),
+        )
+        assert message.photo is not None
+        preview = await bot.send_photo(
+            chat_id=owner_id,
+            photo=message.photo[-1].file_id,
+            caption=post["body_html"] or None,
+            parse_mode="HTML" if post["body_html"] else None,
+            reply_markup=markup,
+        )
+        new_preview_id = preview.message_id
+        previous_message_id = tickets.update_channel_post_preview_photo(
+            post_id,
+            owner_id,
+            message.photo[-1].file_id,
+            new_preview_id,
+        )
+        if previous_message_id is None:
+            await bot.delete_message(owner_id, new_preview_id)
+            new_preview_id = None
+            await state.clear()
+            await message.answer(t("promo.builder.review_photo_expired"))
+            return
+    except (TelegramAPIError, TicketStoreError, PromotionStoreError, RuntimeError, ValueError):
+        logger.exception("Review photo could not be added to channel post")
+        if new_preview_id is not None:
+            try:
+                await bot.delete_message(owner_id, new_preview_id)
+            except TelegramAPIError:
+                logger.warning("Temporary photo preview could not be removed")
+        await message.answer(t("promo.builder.unavailable"))
+        return
+    if post["post_type"] == "promo":
+        try:
+            promotions.log_preparation(
+                post_id, owner_id, "review_photo_added", "разработчик добавил фото"
+            )
+        except PromotionStoreError:
+            logger.exception("Review photo action could not be added to preparation log")
+    if previous_message_id is not None:
+        try:
+            await bot.delete_message(owner_id, previous_message_id)
+        except TelegramAPIError:
+            logger.warning("Previous channel post preview could not be removed")
+    await state.clear()
+    await message.answer(t("promo.builder.review_photo_saved"))
+
+
+@router.message(PromoPostFlow.awaiting_photo, F.text)
+async def promo_post_photo_expected(
+    message: Message, state: FSMContext
+) -> None:
+    if (message.text or "").strip().casefold() in {"/cancel", "отмена"}:
+        await state.clear()
+        await message.answer(t("promo.builder.cancelled"))
+        return
+    await message.answer(t("promo.builder.photo_prompt"))
+
+
+@router.message(PromoPostFlow.awaiting_review_photo, F.text)
+async def promo_review_photo_expected(message: Message) -> None:
+    await message.answer(t("promo.builder.review_photo_prompt"))
 
 
 @router.message(AnnouncementFlow.awaiting_image, F.photo)
@@ -976,6 +1628,10 @@ class DocumentsConsentMiddleware(BaseMiddleware):
                     return await handler(event, data)
                 if is_admin and current_state == "DocumentsFlow:url":
                     return await handler(event, data)
+                if is_admin and current_state and current_state.startswith(
+                    "PromoPostFlow:"
+                ):
+                    return await handler(event, data)
             await event.answer(
                 _documents_consent_text(prefs),
                 reply_markup=_documents_consent_keyboard(prefs),
@@ -986,6 +1642,10 @@ class DocumentsConsentMiddleware(BaseMiddleware):
             action = event.data or ""
             if action.startswith("docs:") or (
                 not is_admin and action.startswith("ticket:")
+            ):
+                return await handler(event, data)
+            if is_admin and action.startswith(
+                ("promo-builder:", "channelpost:")
             ):
                 return await handler(event, data)
             if is_admin and action in {"admin:home", "admin:docs"}:
@@ -1061,6 +1721,7 @@ _device_lock = asyncio.Lock()
 _admin_plan_lock = asyncio.Lock()
 _free_access_lock = asyncio.Lock()
 _balance_purchase_lock = asyncio.Lock()
+_platega_link_lock = asyncio.Lock()
 _device_delete_attempts: dict[int, list[float]] = {}
 DEVICE_DELETE_LIMIT = 5
 DEVICE_DELETE_WINDOW_SECONDS = 60.0
@@ -1872,14 +2533,14 @@ async def _user_screen(
             await callback.answer(t("wallet.unavailable"), show_alert=True)
             return
         stars_for: dict[int, int] = {}
-        for amount in (25_000, 50_000, 100_000, 200_000):
+        for amount in TOPUP_PRESET_AMOUNTS:
             try:
                 stars_for[amount] = stars_for_rub_amount(amount, plans)
             except ValueError:
                 stars_for[amount] = 0
         await callback.answer()
         await _edit_or_send(
-            callback, topup_text(), topup_amount_keyboard(stars_for)
+            callback, topup_text(plans), topup_amount_keyboard(stars_for)
         )
     elif screen == "settings":
         await callback.answer()
@@ -2269,6 +2930,265 @@ async def _show_campaign_connection(
     return True
 
 
+async def _promo_reply(
+    target: Message | CallbackQuery,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    if isinstance(target, Message):
+        await target.answer(text, reply_markup=reply_markup)
+    elif isinstance(target.message, Message):
+        await target.message.answer(text, reply_markup=reply_markup)
+    else:
+        await target.answer(text, show_alert=True)
+
+
+async def _process_pending_promo_start(
+    target: Message | CallbackQuery,
+    bot: Bot,
+    panel: RemnawaveClient,
+    settings: Settings,
+    plans: tuple[Plan, ...] | None,
+    prefs: PreferencesStore,
+    orders: OrderStore | None,
+    promotions: PromotionStore | None,
+) -> bool:
+    user = target.from_user
+    if user is None or promotions is None:
+        return False
+    try:
+        post_id = promotions.pending_start_request(user.id)
+    except PromotionStoreError:
+        logger.exception("Pending promotion request could not be loaded")
+        await _promo_reply(target, t("promo.claim_unavailable"))
+        return True
+    if post_id is None:
+        return False
+    reserved = False
+    try:
+        panel_user = await _load_user(user.id, panel)
+        trial_used = prefs.trial_was_used(user.id)
+        if orders is None:
+            raise OrderError("Purchase history storage is unavailable")
+        had_purchase = orders.user_has_subscription_purchase(user.id)
+        category = (
+            "returning"
+            if panel_user is not None or trial_used or had_purchase
+            else "new"
+        )
+        outcome, previous_category = promotions.reserve_reward(
+            post_id, user.id, category
+        )
+        if outcome == "inactive":
+            promotions.clear_start_request(user.id)
+            await _promo_reply(target, t("promo.claim_inactive"))
+            return True
+        if outcome == "full":
+            promotions.clear_start_request(user.id)
+            await _promo_reply(target, t("promo.claim_full"))
+            return True
+        if outcome == "applied":
+            promotions.clear_start_request(user.id)
+            await _promo_reply(target, t("promo.claim_duplicate"))
+            return True
+        if outcome in {"review", "reserved"} and previous_category is not None:
+            promotions.clear_start_request(user.id)
+            await _promo_reply(
+                target,
+                t(
+                    "promo.claim_processing"
+                    if outcome == "reserved"
+                    else "promo.claim_status"
+                ),
+            )
+            return True
+        if outcome != "claimed":
+            promotions.clear_start_request(user.id)
+            await _promo_reply(target, t("promo.claim_unavailable"))
+            return True
+        reserved = True
+        if plans is None:
+            raise RuntimeError("Plan catalog is unavailable")
+        unlimited = next(
+            (
+                plan
+                for plan in plans
+                if plan.code == "unlimited-7"
+                and plan.traffic_limit_gb is None
+                and plan.panel_tag is not None
+            ),
+            None,
+        )
+        if unlimited is None or settings.panel_internal_squad_uuid is None:
+            raise RuntimeError("Unlimited plan or Panel squad is unavailable")
+        days = PROMO_NEW_DAYS if category == "new" else PROMO_RETURNING_DAYS
+        permanent_tags = {
+            plan.panel_tag for plan in plans if plan.permanent_traffic
+        }
+        if panel_user is None:
+            updated = await panel.create_user(
+                user.id,
+                days,
+                settings.panel_internal_squad_uuid,
+                tag=unlimited.panel_tag,
+            )
+        elif panel_user.status not in {"ACTIVE", "EXPIRED", "LIMITED"}:
+            raise PanelAccessDenied("Existing subscription cannot be extended")
+        elif panel_user.tag == "FREE":
+            updated = await panel.apply_paid_plan(
+                panel_user,
+                days,
+                None,
+                tag=unlimited.panel_tag,
+                traffic_limit_strategy="NO_RESET",
+            )
+        elif panel_user.tag in permanent_tags:
+            raise PanelAccessDenied(
+                "Permanent subscription has no expiration to extend"
+            )
+        else:
+            updated = await panel.extend_user(panel_user, days)
+        if not promotions.finish_reward(user.id, post_id, applied=True):
+            raise PromotionStoreError("Promotion reward state could not be committed")
+        reserved = False
+        promotions.clear_start_request(user.id)
+    except (PanelError, PreferencesError, OrderError, PromotionStoreError, RuntimeError, ValueError) as error:
+        logger.exception("Promotion reward could not be safely completed")
+        if reserved:
+            try:
+                promotions.finish_reward(
+                    user.id,
+                    post_id,
+                    applied=False,
+                    error_code=type(error).__name__,
+                )
+            except PromotionStoreError:
+                logger.exception("Promotion reward review state could not be saved")
+            try:
+                promotions.clear_start_request(user.id)
+            except PromotionStoreError:
+                logger.exception("Promotion start request could not be cleared")
+            try:
+                await bot.send_message(
+                    _announcement_owner_id(settings),
+                    t(
+                        "promo.claim_review_admin",
+                        user_id=user.id,
+                        post_id=post_id,
+                        error=type(error).__name__,
+                    ),
+                )
+            except TelegramAPIError:
+                logger.warning("Promotion review notification could not be delivered")
+            await _promo_reply(target, t("promo.claim_status"))
+        else:
+            await _promo_reply(target, t("promo.claim_unavailable"))
+        return True
+    try:
+        promotions.clear_start_request(user.id)
+        await _promo_reply(
+            target,
+            t(
+                "promo.claim_new"
+                if category == "new"
+                else "promo.claim_returning"
+            ),
+            connect_keyboard(
+                _page_url(updated, settings),
+                has_access=_has_access(updated),
+                support=support_url(settings.support_contact),
+                trial_available=False,
+            ),
+        )
+    except (PromotionStoreError, TelegramAPIError):
+        logger.exception("Promotion reward confirmation could not be delivered")
+    try:
+        await bot.send_message(
+            _announcement_owner_id(settings),
+            (
+                "Промоподарок выдан\n"
+                f"Пост: #{post_id}\nКатегория: {category}\n"
+                f"Пользователь: {user.id}\nДней: {days}"
+            ),
+        )
+    except TelegramAPIError:
+        logger.warning("Promotion reward notification could not be delivered")
+    return True
+
+
+def _start_text(first_name: str, body: str) -> str:
+    return t("start.welcome", name=escape(first_name)) + "\n\n" + body
+
+
+def _start_keyboard(markup: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
+    # Decorate a copy: the same keyboards are used on other screens.
+    markup = markup.model_copy(deep=True)
+    for row_index, row in enumerate(markup.inline_keyboard):
+        for button in row:
+            action = button.callback_data or ""
+            button.style = "primary"
+            # Unicode text symbols remain visible without owner Premium.
+            button.icon_custom_emoji_id = None
+            icon = "≡"
+            if action.startswith("docs:accept:") or (
+                row_index == 0 and not action.startswith("docs:")
+            ):
+                button.style = "success"
+                icon = "✓" if action.startswith("docs:accept:") else "ϟ"
+            elif action in {"user:help", "user:about", "ticket:open"}:
+                icon = "?" if action != "user:about" else "ⓘ"
+            elif action == "user:cabinet":
+                icon = "⌂"
+            elif action == "admin:home":
+                button.style = "danger"
+                icon = "⚙\ufe0e"
+            elif button.url:
+                icon = "↗"
+            if button.text and not any(char.isalnum() for char in button.text.split()[0]):
+                button.text = button.text.partition(" ")[2] or button.text
+            button.text = f"{icon} {button.text}"
+    return markup
+
+
+async def _answer_start(
+    message: Message,
+    text: str,
+    markup: InlineKeyboardMarkup,
+    *,
+    prefs: PreferencesStore,
+    banner: str,
+) -> None:
+    animation = Path(__file__).with_name("assets") / "banners" / "start-welcome.gif"
+    if animation.is_file() and len(text) <= 1024:
+        # A new asset must never reuse the Telegram ID of an earlier GIF.
+        cache_key = f"start-animation-v3:{sha256(animation.read_bytes()).hexdigest()}"
+        cached = None
+        try:
+            cached = prefs.banner_file_id(cache_key)
+        except PreferencesError:
+            logger.warning("Start animation cache is unavailable")
+        sources = [cached, FSInputFile(animation)] if cached else [FSInputFile(animation)]
+        for source in sources:
+            try:
+                sent = await message.answer_animation(
+                    animation=source,
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                    disable_notification=True,
+                )
+            except TelegramAPIError:
+                logger.warning("Start animation delivery failed; trying fallback")
+                continue
+            if sent.animation is not None:
+                try:
+                    prefs.set_banner_file_id(cache_key, sent.animation.file_id)
+                except PreferencesError:
+                    logger.warning("Start animation cache could not be saved")
+            return
+    await answer_screen(message, text, markup, prefs=prefs, banner=banner)
+
+
 @router.message(CommandStart())
 async def start(
     message: Message,
@@ -2279,6 +3199,9 @@ async def start(
     prefs: PreferencesStore | None = None,
     wallet: WalletStore | None = None,
     tickets: TicketStore | None = None,
+    orders: OrderStore | None = None,
+    promotions: PromotionStore | None = None,
+    plans: tuple[Plan, ...] | None = None,
 ) -> None:
     await _clear_state(state)
     if not _private_chat(message):
@@ -2292,6 +3215,7 @@ async def start(
     referrer_id: int | None = None
     campaign_protocol: str | None = None
     channel_post_click: tuple[int, int] | None = None
+    promo_post_id: int | None = None
     try:
         prefs.reset_navigation(message.from_user.id)
         command_parts = (message.text or "").split(maxsplit=1)
@@ -2306,6 +3230,12 @@ async def start(
                     int(post_click.group(1)),
                     int(post_click.group(2)),
                 )
+            promo_match = re.fullmatch(
+                rf"{re.escape(PROMO_START_PREFIX)}([1-9][0-9]{{0,18}})",
+                start_parameter,
+            )
+            if promo_match is not None:
+                promo_post_id = int(promo_match.group(1))
         if len(command_parts) == 2 and re.fullmatch(
             r"ref_[1-9][0-9]{0,18}", command_parts[1].strip()
         ):
@@ -2362,17 +3292,46 @@ async def start(
         await message.answer(t("docs.accept_failed"))
         return
     privacy_url, agreement_url = _document_urls(prefs)
+    if promo_post_id is not None:
+        if promotions is None:
+            await message.answer(t("promo.claim_unavailable"))
+            return
+        try:
+            if not promotions.store_start_request(
+                message.from_user.id, promo_post_id
+            ):
+                await message.answer(t("promo.claim_inactive"))
+                return
+        except PromotionStoreError:
+            logger.exception("Promotion button click could not be recorded")
+            await message.answer(t("promo.claim_unavailable"))
+            return
     if (
         not consented
         and privacy_url is not None
         and agreement_url is not None
     ):
-        await answer_screen(
+        await _answer_start(
             message,
-            _documents_consent_text(prefs),
-            _documents_consent_keyboard(prefs),
+            _start_text(
+                message.from_user.first_name or t("common.friend"),
+                _documents_consent_text(prefs),
+            ),
+            _start_keyboard(_documents_consent_keyboard(prefs)),
+            prefs=prefs,
             banner="support",
         )
+        return
+    if await _process_pending_promo_start(
+        message,
+        bot,
+        panel,
+        settings,
+        plans,
+        prefs,
+        orders,
+        promotions,
+    ):
         return
     if await _show_campaign_connection(message, panel, settings, prefs):
         return
@@ -2427,16 +3386,29 @@ async def start(
     onboarding = _setup_step(prefs, message.from_user.id) < 3
     if onboarding:
         text += "\n\n" + t("setup.intro")
-    await answer_screen(
+    text = _start_text(
+        message.from_user.first_name or t("common.friend"),
+        text.removeprefix(
+            t(
+                "home.greeting",
+                name=escape(message.from_user.first_name or t("common.friend")),
+            )
+            + "\n\n"
+        ),
+    )
+    await _answer_start(
         message,
         text,
-        home_keyboard(
-            _is_admin(message, settings),
-            page_url,
-            has_access=has_access,
-            trial_available=trial_available,
-            onboarding=onboarding,
+        _start_keyboard(
+            home_keyboard(
+                _is_admin(message, settings),
+                page_url,
+                has_access=has_access,
+                trial_available=trial_available,
+                onboarding=onboarding,
+            )
         ),
+        prefs=prefs,
         banner="home",
     )
 
@@ -2444,9 +3416,13 @@ async def start(
 @router.callback_query(F.data.startswith("docs:"))
 async def documents_navigation(
     callback: CallbackQuery,
+    bot: Bot,
     panel: RemnawaveClient,
     settings: Settings,
     prefs: PreferencesStore | None = None,
+    orders: OrderStore | None = None,
+    promotions: PromotionStore | None = None,
+    plans: tuple[Plan, ...] | None = None,
 ) -> None:
     if callback.message is None or callback.message.chat.type != "private":
         await callback.answer(t("alert.private_chat"), show_alert=True)
@@ -2481,6 +3457,17 @@ async def documents_navigation(
             await callback.answer(t("docs.accept_failed"), show_alert=True)
             return
         await callback.answer(t("docs.accepted", version=current_version))
+        if await _process_pending_promo_start(
+            callback,
+            bot,
+            panel,
+            settings,
+            plans,
+            prefs,
+            orders,
+            promotions,
+        ):
+            return
         if await _show_campaign_connection(callback, panel, settings, prefs):
             return
         text, page_url, has_access, trial_available = await _home_view(
@@ -2494,7 +3481,7 @@ async def documents_navigation(
             callback,
             text,
             home_keyboard(
-                _is_admin(callback, settings),
+                callback.from_user.id in settings.admin_telegram_ids,
                 page_url,
                 has_access=has_access,
                 trial_available=trial_available,
@@ -3549,6 +4536,18 @@ async def _ticket_message_input(
                 body,
                 photo_file_id,
             )
+        except TicketRateLimited as error:
+            await message.answer(
+                t(
+                    "ticket.rate_limited",
+                    wait=(
+                        f"{max(1, (error.retry_after_seconds + 3599) // 3600)} ч"
+                        if error.retry_after_seconds >= 3600
+                        else f"{max(1, (error.retry_after_seconds + 59) // 60)} мин."
+                    ),
+                )
+            )
+            return
         except (TicketStoreError, ValueError):
             logger.warning("Support ticket creation failed")
             await message.answer(t("ticket.unavailable"))
@@ -3613,6 +4612,18 @@ async def _ticket_message_input(
             await state.clear()
             await message.answer(t("ticket.no_open"))
             return
+    except TicketRateLimited as error:
+        await message.answer(
+            t(
+                "ticket.rate_limited",
+                wait=(
+                    f"{max(1, (error.retry_after_seconds + 3599) // 3600)} ч"
+                    if error.retry_after_seconds >= 3600
+                    else f"{max(1, (error.retry_after_seconds + 59) // 60)} мин."
+                ),
+            )
+        )
+        return
     except (TicketStoreError, ValueError):
         logger.warning("Support ticket reply could not be stored")
         await message.answer(t("ticket.unavailable"))
@@ -4230,15 +5241,18 @@ def _order_is_recent(order, seconds: int = 45) -> bool:
     return timedelta(0) <= age <= timedelta(seconds=seconds)
 
 
-def _order_plan_term(
-    plan: Plan, order
-) -> tuple[int, PlanTerm | None] | None:
+def _order_plan_term(plan: Plan, order) -> tuple[int, PlanTerm | None] | None:
     days = order.term_days or plan.days
     term = plan.term_for(days)
     if plan.sellable and term is None:
         return None
     expected_stars = term.stars_amount if term is not None else plan.price_minor
-    if order.amount_minor != expected_stars:
+    expected_amount = (
+        order.rub_price_minor
+        if getattr(order, "provider", None) == "platega"
+        else expected_stars
+    )
+    if order.amount_minor != expected_amount:
         return None
     if term is None:
         if order.rub_price_minor is not None:
@@ -4526,6 +5540,8 @@ def _parse_rub_amount(raw: str) -> int | None:
         if cleaned.endswith(suffix):
             cleaned = cleaned[: -len(suffix)]
             break
+    if len(cleaned) > 32 or re.fullmatch(r"\d+(?:\.\d{1,2})?", cleaned) is None:
+        return None
     try:
         value = Decimal(cleaned)
     except InvalidOperation:
@@ -4534,6 +5550,101 @@ def _parse_rub_amount(raw: str) -> int | None:
         return None
     minor = int((value * 100).to_integral_value(rounding=ROUND_HALF_UP))
     return minor if minor > 0 else None
+
+
+async def _topup_callback_amount(
+    callback: CallbackQuery,
+    state: FSMContext,
+    raw_amount: str | None,
+) -> int | None:
+    if raw_amount is not None:
+        amount = (
+            int(raw_amount)
+            if raw_amount.isascii() and raw_amount.isdigit() and len(raw_amount) <= 10
+            else None
+        )
+    else:
+        amount = None
+        if isinstance(callback.message, Message):
+            match = re.search(
+                r"Сумма пополнения:\s*([\d\s\u00a0]+(?:[.,]\d{1,2})?)",
+                callback.message.text or callback.message.caption or "",
+            )
+            amount = None if match is None else _parse_rub_amount(match[1])
+        if amount is None:
+            amount = (await state.get_data()).get("topup_amount_minor")
+    if isinstance(amount, bool) or not isinstance(amount, int):
+        return None
+    return amount if MIN_TOPUP_MINOR <= amount <= MAX_TOPUP_MINOR else None
+
+
+async def _restore_topup_amounts(
+    callback: CallbackQuery,
+    state: FSMContext,
+    plans: tuple[Plan, ...],
+) -> None:
+    await state.clear()
+    await callback.answer(t("payments.select_amount"))
+    await _edit_or_send(
+        callback,
+        topup_text(plans),
+        topup_amount_keyboard(
+            {
+                amount: stars_for_rub_amount(amount, plans)
+                for amount in TOPUP_PRESET_AMOUNTS
+            }
+        ),
+    )
+
+
+async def _payment_return_url(bot: Bot) -> str:
+    username = (await bot.me()).username
+    if not username:
+        raise ValueError("Bot username is unavailable")
+    return f"https://t.me/{username}"
+
+
+async def _send_platega_link(
+    callback: CallbackQuery,
+    bot: Bot,
+    payments: PaymentStore,
+    payment_id: str,
+    payment_url: str,
+    kind: str,
+    local_id: str,
+    amount_minor: int,
+) -> None:
+    assert isinstance(callback.message, Message)
+    payments.track(payment_id)
+    text = t(
+        "platega.payment_link",
+        amount=format_rubles(amount_minor),
+        payment_id=escape(payment_id),
+    )
+    markup = platega_payment_keyboard(payment_url, kind, local_id)
+    screen = payments.screen(payment_id)
+    if screen is not None and screen[0] == callback.from_user.id:
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=screen[0],
+                message_id=screen[1],
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+        except TelegramBadRequest as error:
+            if "message is not modified" in error.message.casefold():
+                payments.record_screen(payment_id, screen[0], screen[1])
+                return
+        else:
+            payments.record_screen(payment_id, screen[0], screen[1])
+            return
+    sent = await callback.message.answer(
+        text,
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+    payments.record_screen(payment_id, callback.from_user.id, sent.message_id)
 
 
 async def _send_topup_invoice(
@@ -4573,7 +5684,11 @@ async def topup_navigation(
     callback: CallbackQuery,
     plans: tuple[Plan, ...],
     state: FSMContext,
+    settings: Settings,
+    bot: Bot,
     wallet: WalletStore | None = None,
+    platega: PlategaClient | None = None,
+    payments: PaymentStore | None = None,
 ) -> None:
     if callback.message is None or callback.message.chat.type != "private":
         await callback.answer(t("alert.private_chat"), show_alert=True)
@@ -4601,15 +5716,13 @@ async def topup_navigation(
             ),
         )
         return
-    if action == "pay:stars":
-        data = await state.get_data()
-        amount_minor = data.get("topup_amount_minor")
-        if (
-            not isinstance(amount_minor, int)
-            or not MIN_TOPUP_MINOR <= amount_minor <= 10_000_000
-        ):
-            await state.clear()
-            await callback.answer(t("alert.stale_button_short"), show_alert=True)
+    if action == "pay:stars" or action.startswith("pay:stars:"):
+        raw_amount = (
+            None if action == "pay:stars" else action.removeprefix("pay:stars:")
+        )
+        amount_minor = await _topup_callback_amount(callback, state, raw_amount)
+        if amount_minor is None:
+            await _restore_topup_amounts(callback, state, plans)
             return
         await state.clear()
         await callback.answer()
@@ -4617,6 +5730,94 @@ async def topup_navigation(
             callback.message, wallet, plans, callback.from_user.id, amount_minor
         ):
             await callback.message.answer(t("wallet.unavailable"))
+        return
+    if action.startswith("pay:platega:"):
+        parts = action.split(":")
+        method_value = parts[2] if len(parts) in {3, 4} else ""
+        if (
+            not settings.platega_enabled
+            or platega is None
+            or not method_value.isdigit()
+            or int(method_value) not in PlategaClient.PAYMENT_METHODS
+        ):
+            await callback.answer(t("wallet.unavailable"), show_alert=True)
+            return
+        amount_minor = await _topup_callback_amount(
+            callback, state, parts[3] if len(parts) == 4 else None
+        )
+        if amount_minor is None:
+            await _restore_topup_amounts(callback, state, plans)
+            return
+        await state.clear()
+        await callback.answer()
+        payments = payments or PaymentStore(wallet.database_path)
+        try:
+            async with _platega_link_lock:
+                topup = wallet.create_topup(
+                    callback.from_user.id,
+                    amount_minor,
+                    stars_for_rub_amount(amount_minor, plans),
+                    provider="platega",
+                    payment_method=int(method_value),
+                )
+                if topup.provider_payment_id and topup.provider_payment_url:
+                    payment_id, payment_url = (
+                        topup.provider_payment_id,
+                        topup.provider_payment_url,
+                    )
+                else:
+                    return_url = await _payment_return_url(bot)
+                    link = await platega.create_payment(
+                        amount=Decimal(amount_minor) / 100,
+                        currency="RUB",
+                        payment_method=int(method_value),
+                        description=f"Jopes VPN wallet top-up {topup.id}",
+                        return_url=return_url,
+                        failed_url=return_url,
+                        order_id=topup.id,
+                        user_id=callback.from_user.id,
+                        user_name=callback.from_user.username or "",
+                    )
+                    topup = wallet.save_topup_payment_link(
+                        topup.id,
+                        link.transaction_id,
+                        link.url,
+                        expires_at=link.expires_at(),
+                    )
+                    payment_id, payment_url = link.transaction_id, link.url
+                wallet.record_pending_payment(
+                    payment_id=topup.id,
+                    telegram_id=callback.from_user.id,
+                    amount_minor=amount_minor,
+                    reference=f"topup_payment:{topup.id}",
+                    external_payment_id=payment_id,
+                    purpose="topup",
+                )
+                payments.track(payment_id)
+        except PlategaError as error:
+            logger.warning("Platega top-up link could not be created")
+            await callback.message.answer(
+                t(
+                    "payments.method_unavailable"
+                    if error.status_code == 400
+                    else "wallet.unavailable"
+                )
+            )
+            return
+        except (ValueError, WalletError, sqlite3.Error):
+            logger.warning("Platega top-up link could not be saved")
+            await callback.message.answer(t("wallet.unavailable"))
+            return
+        await _send_platega_link(
+            callback,
+            bot,
+            payments,
+            payment_id,
+            payment_url,
+            "topup",
+            topup.id,
+            amount_minor,
+        )
         return
     if action == "custom":
         await state.set_state(TopUpFlow.awaiting_amount)
@@ -4633,7 +5834,7 @@ async def topup_navigation(
             await callback.answer(t("alert.stale_button_short"), show_alert=True)
             return
         amount_minor = int(raw_amount)
-        if not MIN_TOPUP_MINOR <= amount_minor <= 10_000_000:
+        if not MIN_TOPUP_MINOR <= amount_minor <= MAX_TOPUP_MINOR:
             await callback.answer(
                 t("wallet.topup_invalid", minimum=format_rubles(MIN_TOPUP_MINOR)),
                 show_alert=True,
@@ -4654,7 +5855,11 @@ async def topup_navigation(
                 amount=format_rubles(amount_minor),
                 stars=stars,
             ),
-            topup_methods_keyboard(stars),
+            topup_methods_keyboard(
+                stars,
+                amount_minor=amount_minor,
+                platega_enabled=settings.platega_enabled,
+            ),
         )
         return
     await callback.answer(t("alert.stale_button_short"), show_alert=True)
@@ -4663,6 +5868,7 @@ async def topup_navigation(
 @router.message(TopUpFlow.awaiting_amount)
 async def topup_amount_input(
     message: Message,
+    settings: Settings,
     plans: tuple[Plan, ...],
     state: FSMContext,
     wallet: WalletStore | None = None,
@@ -4685,9 +5891,9 @@ async def topup_amount_input(
             t("wallet.topup_invalid", minimum=format_rubles(MIN_TOPUP_MINOR))
         )
         return
-    if amount_minor > 10_000_000:
+    if amount_minor > MAX_TOPUP_MINOR:
         await message.answer(
-            t("wallet.topup_too_large", maximum=format_rubles(10_000_000))
+            t("wallet.topup_too_large", maximum=format_rubles(MAX_TOPUP_MINOR))
         )
         return
     if amount_minor < MIN_TOPUP_MINOR:
@@ -4708,7 +5914,9 @@ async def topup_amount_input(
             amount=format_rubles(amount_minor),
             stars=stars,
         ),
-        reply_markup=topup_methods_keyboard(stars),
+        reply_markup=topup_methods_keyboard(
+            stars, amount_minor=amount_minor, platega_enabled=settings.platega_enabled
+        ),
         parse_mode="HTML",
     )
 
@@ -4992,8 +6200,11 @@ async def _pay_plan_with_balance(
         updated = await _fulfill_order(
             callback.from_user.id, plan, order_term, panel, settings
         )
-        orders.mark_fulfilled(order.id)
-        wallet.complete_order_payment(order.id, status="SUCCESS")
+        if not orders.mark_fulfilled(
+            order.id,
+            payment_completer=wallet.complete_order_payment_locked,
+        ):
+            raise OrderStateError("Balance order fulfillment state changed")
         transaction = wallet.payment_transaction(order.id)
         if transaction is None:
             raise WalletError("Successful order payment is missing from history")
@@ -5109,7 +6320,9 @@ async def choose_plan_term(
     await _edit_or_send(
         callback,
         _plan_term_payment_text(plan, term),
-        payment_methods_keyboard(plan, term),
+        payment_methods_keyboard(
+            plan, term, platega_enabled=settings.platega_enabled
+        ),
     )
 
 
@@ -5122,6 +6335,9 @@ async def create_stars_invoice(
     plans: tuple[Plan, ...],
     orders: OrderStore,
     prefs: PreferencesStore | None = None,
+    wallet: WalletStore | None = None,
+    platega: PlategaClient | None = None,
+    payments: PaymentStore | None = None,
 ) -> None:
     if callback.message is None or callback.message.chat.type != "private":
         await callback.answer(t("alert.private_chat"), show_alert=True)
@@ -5148,17 +6364,29 @@ async def create_stars_invoice(
         if plan is None or term is None:
             await callback.answer(t("alert.stale_button_short"), show_alert=True)
             return
-        await callback.answer(
-            t("plans.payment_unavailable"), show_alert=True
-        )
+        await callback.answer(t("plans.payment_unavailable"), show_alert=True)
         return
     operation_key: str | None = None
     selected_days: int | None = None
+    platega_method: int | None = None
     if is_admin:
         if len(parts) != 2 or not re.fullmatch(r"[A-Za-z0-9_-]{16}", parts[1]):
             await callback.answer(t("plans.invalid_invoice"), show_alert=True)
             return
         code, operation_key = parts
+    elif len(parts) == 4 and parts[0] == "platega":
+        if (
+            not settings.platega_enabled
+            or platega is None
+            or not parts[2].isdigit()
+            or not parts[3].isdigit()
+            or int(parts[3]) not in PlategaClient.PAYMENT_METHODS
+        ):
+            await callback.answer(t("plans.payment_unavailable"), show_alert=True)
+            return
+        code = parts[1]
+        selected_days = int(parts[2])
+        platega_method = int(parts[3])
     else:
         if len(parts) == 3 and parts[0] == "stars":
             code = parts[1]
@@ -5193,14 +6421,22 @@ async def create_stars_invoice(
     if not is_admin and (not plan.sellable or selected_term is None):
         await callback.answer(t("plans.invalid_invoice"), show_alert=True)
         return
+    if not is_admin:
+        await callback.answer()
     try:
         user = await _load_user(callback.from_user.id, panel)
     except PanelError as error:
-        logger.warning("Subscription pre-purchase check failed (%s)", type(error).__name__)
-        await callback.answer(t("plans.purchase_blocked"), show_alert=True)
+        logger.warning(
+            "Subscription pre-purchase check failed (%s)", type(error).__name__
+        )
+        if is_admin:
+            await callback.answer(t("plans.purchase_blocked"), show_alert=True)
+        else:
+            await callback.message.answer(t("plans.purchase_blocked"))
         return
     if (
-        user is not None and user.status not in {"ACTIVE", "EXPIRED"}
+        user is not None
+        and user.status not in {"ACTIVE", "EXPIRED"}
         and not (
             user.status == "LIMITED"
             and (
@@ -5210,24 +6446,98 @@ async def create_stars_invoice(
             )
         )
     ) or (user is None and settings.panel_internal_squad_uuid is None):
-        await callback.answer(t("plans.purchase_blocked"), show_alert=True)
+        if is_admin:
+            await callback.answer(t("plans.purchase_blocked"), show_alert=True)
+        else:
+            await callback.message.answer(t("plans.purchase_blocked"))
         return
     if is_admin:
         assert operation_key is not None
-        await _grant_admin_plan(
-            callback, panel, settings, plan, prefs, operation_key
-        )
+        await _grant_admin_plan(callback, panel, settings, plan, prefs, operation_key)
         return
     if selected_term is None:
-        await callback.answer(t("plans.invalid_invoice"), show_alert=True)
+        await callback.message.answer(t("plans.invalid_invoice"))
+        return
+    if platega_method is not None:
+        assert platega is not None
+        if wallet is None:
+            await callback.message.answer(t("wallet.unavailable"))
+            return
+        payments = payments or PaymentStore(wallet.database_path)
+        try:
+            async with _platega_link_lock:
+                order = orders.create_order(
+                    callback.from_user.id,
+                    plan,
+                    selected_term,
+                    provider="platega",
+                    payment_method=platega_method,
+                )
+                if order.provider_payment_id and order.provider_payment_url:
+                    payment_id, payment_url = (
+                        order.provider_payment_id,
+                        order.provider_payment_url,
+                    )
+                else:
+                    return_url = await _payment_return_url(bot)
+                    link = await platega.create_payment(
+                        amount=Decimal(order.amount_minor) / 100,
+                        currency=order.currency,
+                        payment_method=platega_method,
+                        description=f"Jopes VPN {plan.title} · {selected_term.days} days",
+                        return_url=return_url,
+                        failed_url=return_url,
+                        order_id=order.id,
+                        user_id=callback.from_user.id,
+                        user_name=callback.from_user.username or "",
+                    )
+                    order = orders.save_payment_link(
+                        order.id,
+                        link.transaction_id,
+                        link.url,
+                        expires_at=link.expires_at(),
+                    )
+                    payment_id, payment_url = link.transaction_id, link.url
+                wallet.record_pending_payment(
+                    payment_id=order.id,
+                    telegram_id=order.telegram_id,
+                    amount_minor=order.amount_minor,
+                    reference=f"order_payment:{order.id}",
+                    external_payment_id=payment_id,
+                    purpose="subscription",
+                )
+                payments.track(payment_id)
+        except PlategaError as error:
+            logger.warning("Platega subscription link could not be created")
+            await callback.message.answer(
+                t(
+                    "payments.method_unavailable"
+                    if error.status_code == 400
+                    else "plans.payment_unavailable"
+                )
+            )
+            return
+        except (OrderError, WalletError, sqlite3.Error, ValueError):
+            logger.warning("Platega subscription link could not be saved")
+            await callback.message.answer(t("plans.payment_unavailable"))
+            return
+        await _send_platega_link(
+            callback,
+            bot,
+            payments,
+            payment_id,
+            payment_url,
+            "order",
+            order.id,
+            order.amount_minor,
+        )
         return
     try:
         order = orders.create_order(callback.from_user.id, plan, selected_term)
     except (OrderError, sqlite3.Error):
         logger.warning("Stars order could not be created")
-        await callback.answer(t("plans.invalid_invoice"), show_alert=True)
+        await callback.message.answer(t("plans.invalid_invoice"))
         return
-    await callback.answer()
     try:
         await callback.message.answer_invoice(
             title=t("plans.invoice_title", plan=plan.title),
@@ -5398,18 +6708,8 @@ def _receipt_amount(transaction: PaymentTransaction) -> str:
     return format_rubles(transaction.rub_amount_minor)
 
 
-def _receipt_for_transaction(
-    transaction: PaymentTransaction, *, operation: str
-) -> str:
-    method = (
-        t("wallet.receipt_method_stars")
-        if transaction.method == "telegram_stars"
-        else t("wallet.receipt_method_balance")
-        if transaction.method == "wallet"
-        else t("wallet.receipt_method_manual")
-        if transaction.method == "manual"
-        else transaction.method
-    )
+def _receipt_for_transaction(transaction: PaymentTransaction, *, operation: str) -> str:
+    method = payment_method_text(transaction.method)
     return payment_receipt_text(
         operation_id=transaction.id,
         operation=operation,
@@ -5523,8 +6823,11 @@ async def process_stars_payment(
         updated = await _fulfill_order(
             message.from_user.id, plan, order_term, panel, settings
         )
-        orders.mark_fulfilled(order.id)
-        wallet.complete_order_payment(order.id, status="SUCCESS")
+        if not orders.mark_fulfilled(
+            order.id,
+            payment_completer=wallet.complete_order_payment_locked,
+        ):
+            raise OrderStateError("Stars order fulfillment state changed")
         transaction = wallet.payment_transaction(order.id)
         if transaction is None:
             raise WalletError("Successful order payment is missing from history")
@@ -5624,6 +6927,603 @@ async def _process_topup_payment(
         await _notify_referral_reward(bot, reward, topup=True)
     except TelegramAPIError:
         logger.warning("Top-up referral notification delivery failed")
+
+
+def _platega_minor_units(amount: Decimal) -> int:
+    minor = amount * 100
+    if not amount.is_finite() or minor != minor.to_integral_value():
+        raise PlategaProtocolError("Platega amount has unsupported precision")
+    return int(minor)
+
+
+async def _apply_platega_status(
+    payment: TransactionStatus,
+    *,
+    bot: Bot,
+    panel: RemnawaveClient,
+    settings: Settings,
+    plans: tuple[Plan, ...],
+    orders: OrderStore,
+    wallet: WalletStore,
+    payments: PaymentStore | None = None,
+) -> str:
+    payments = payments or PaymentStore(wallet.database_path)
+    payments.track(payment.transaction_id)
+    async with payments.processing_lock(payment.transaction_id):
+        result = await _apply_platega_status_locked(
+            payment,
+            bot=bot,
+            panel=panel,
+            settings=settings,
+            plans=plans,
+            orders=orders,
+            wallet=wallet,
+            payments=payments,
+        )
+        if result != "pending":
+            payments.queue_screen(
+                payment.transaction_id,
+                result,
+                t(
+                    "payments.status_screen",
+                    status=t(f"platega.status_{result}"),
+                    amount=format_rubles(_platega_minor_units(payment.amount)),
+                    payment_id=escape(payment.transaction_id),
+                ),
+            )
+        return result
+
+
+def _queue_payment_referral(
+    payments: PaymentStore,
+    reward,
+    reference: str,
+    *,
+    topup: bool,
+) -> None:
+    if reward is None or reward.amount_minor <= 0:
+        return
+    payments.queue_notice(
+        f"referral:{reference}",
+        reward.referrer_id,
+        t(
+            "referral.reward_notice",
+            amount=format_rubles(reward.amount_minor),
+            event=t(
+                "referral.reward_topup_event"
+                if topup
+                else "referral.reward_purchase_event",
+                percent=reward.percent,
+            ),
+        ),
+    )
+
+
+def _queue_platega_review(
+    payments: PaymentStore,
+    settings: Settings,
+    orders: OrderStore,
+    order_id: str,
+    telegram_id: int,
+) -> None:
+    payments.queue_notice(f"review:{order_id}", telegram_id, t("plans.paid_review"))
+    for admin_id in settings.admin_telegram_ids:
+        payments.queue_notice(
+            f"review:{order_id}:{admin_id}",
+            admin_id,
+            t("plans.payment_issue_admin", order_id=escape(order_id)),
+        )
+    orders.mark_review_notified(order_id)
+
+
+async def _apply_platega_status_locked(
+    payment: TransactionStatus,
+    *,
+    bot: Bot,
+    panel: RemnawaveClient,
+    settings: Settings,
+    plans: tuple[Plan, ...],
+    orders: OrderStore,
+    wallet: WalletStore,
+    payments: PaymentStore,
+) -> str:
+    topup = wallet.topup_by_payment_id(payment.transaction_id)
+    order = orders.get_by_payment_id(payment.transaction_id, provider="platega")
+    if topup is not None and topup.provider != "platega":
+        raise PlategaProtocolError("Payment provider does not match")
+    if topup is None and order is None and payment.payload is not None:
+        try:
+            local_id = UUID(payment.payload).hex
+        except (ValueError, TypeError, AttributeError):
+            raise PlategaProtocolError("Platega payload is invalid") from None
+        try:
+            candidate_topup = wallet.topup(local_id)
+            if (
+                candidate_topup.provider == "platega"
+                and candidate_topup.provider_payment_id is None
+            ):
+                topup = candidate_topup
+        except TopupNotFound:
+            pass
+        try:
+            candidate_order = orders.get(local_id)
+            if (
+                candidate_order.provider == "platega"
+                and candidate_order.provider_payment_id is None
+            ):
+                order = candidate_order
+        except OrderNotFound:
+            pass
+    if (topup is None) == (order is None):
+        raise PlategaProtocolError("Platega transaction has no unique local payment")
+    if topup is not None:
+        local_id = topup.id
+        expected_minor = topup.amount_minor
+    else:
+        assert order is not None
+        local_id = order.id
+        expected_minor = order.amount_minor
+    if payment.payload is not None:
+        try:
+            if UUID(payment.payload).hex != UUID(local_id).hex:
+                raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            raise PlategaProtocolError(
+                "Platega payload does not match the local payment"
+            ) from None
+    if (
+        payment.currency != "RUB"
+        or _platega_minor_units(payment.amount) != expected_minor
+    ):
+        raise PlategaProtocolError("Platega amount or currency does not match")
+    if topup is not None and topup.provider_payment_id is None:
+        topup = wallet.save_topup_payment_link(topup.id, payment.transaction_id)
+    elif order is not None and order.provider_payment_id is None:
+        order = orders.save_payment_link(order.id, payment.transaction_id)
+    wallet.record_pending_payment(
+        payment_id=local_id,
+        telegram_id=topup.telegram_id if topup is not None else order.telegram_id,
+        amount_minor=expected_minor,
+        reference=f"topup_payment:{local_id}"
+        if topup is not None
+        else f"order_payment:{local_id}",
+        external_payment_id=payment.transaction_id,
+        purpose="topup" if topup is not None else "subscription",
+    )
+    if payment.status == "PENDING":
+        return "pending"
+    if payment.status == "CANCELED":
+        local_status = topup.status if topup is not None else order.status
+        if local_status == "REFUNDED":
+            return "refunded"
+        if local_status == FULFILLMENT_REVIEW:
+            return "review"
+        if local_status in {"CREDITED", "REFUNDING", PAID, FULFILLING, FULFILLED}:
+            return "confirmed"
+        if topup is not None:
+            wallet.cancel_topup(topup.id)
+        elif order is not None:
+            try:
+                orders.cancel(order.id)
+            except OrderStateError:
+                pass
+        wallet.update_provider_payment_status(payment.transaction_id, "CANCELED")
+        payments.queue_notice(
+            f"canceled:{local_id}",
+            topup.telegram_id if topup is not None else order.telegram_id,
+            t("platega.status_canceled"),
+        )
+        return "canceled"
+    if payment.status == "CHARGEBACKED":
+        if topup is not None:
+            wallet.refund_topup(topup.id)
+            target_id, telegram_id = topup.id, topup.telegram_id
+        else:
+            assert order is not None
+            wallet.refund_order(order.id)
+            target_id, telegram_id = order.id, order.telegram_id
+        wallet.update_provider_payment_status(payment.transaction_id, "REFUNDED")
+        for admin_id in settings.admin_telegram_ids:
+            payments.queue_notice(
+                f"refund:{target_id}:{admin_id}",
+                admin_id,
+                t("platega.refund_admin", payment_id=escape(target_id)),
+            )
+        payments.queue_notice(
+            f"refund:{target_id}", telegram_id, t("plans.refund_user_notice")
+        )
+        return "refunded"
+    if payment.status != "CONFIRMED":
+        raise PlategaProtocolError("Unsupported Platega status")
+
+    if topup is not None:
+        if topup.status == "REFUNDED":
+            return "refunded"
+        if topup.status == "REFUNDING":
+            return "confirmed"
+        topup, _changed, reward = wallet.confirm_topup(
+            topup.id,
+            provider_payment_id=payment.transaction_id,
+            amount_minor=expected_minor,
+            currency=payment.currency,
+            provider="platega",
+        )
+        account = wallet.account(topup.telegram_id)
+        transaction = wallet.payment_transaction(topup.id)
+        if transaction is None:
+            raise WalletError("Confirmed Platega top-up is missing from history")
+        payments.queue_notice(
+            f"topup:{topup.id}",
+            topup.telegram_id,
+            t(
+                "wallet.topup_success",
+                amount=format_rubles(topup.amount_minor),
+                bonus=format_rubles(wallet.topup_bonus_minor(topup.id)),
+                balance=format_rubles(account.balance_minor),
+            )
+            + _receipt_for_transaction(
+                transaction, operation=t("wallet.receipt_topup")
+            ),
+        )
+        _queue_payment_referral(payments, reward, topup.id, topup=True)
+        return "confirmed"
+
+    assert order is not None
+    order, _changed = orders.confirm_payment(
+        order.id,
+        provider="platega",
+        provider_payment_id=payment.transaction_id,
+        amount_minor=expected_minor,
+        currency=payment.currency,
+        payment_recorder=lambda connection, paid_order: (
+            wallet.record_order_payment_locked(
+                connection,
+                order_id=paid_order.id,
+                telegram_id=paid_order.telegram_id,
+                amount_paid_minor=paid_order.amount_minor,
+                currency=paid_order.currency,
+                method="platega",
+                external_payment_id=payment.transaction_id,
+            )
+        ),
+    )
+    if order.status == REFUNDED:
+        return "refunded"
+    if order.status == FULFILLMENT_REVIEW:
+        _queue_platega_review(payments, settings, orders, order.id, order.telegram_id)
+        return "review"
+    if order.status == FULFILLED:
+        transaction = wallet.payment_transaction(order.id)
+        if transaction is None:
+            raise WalletError("Successful Platega order is missing from history")
+        if order.rub_price_minor is not None:
+            reward = wallet.reward_referral_purchase(
+                order.id, order.telegram_id, order.rub_price_minor
+            )
+            _queue_payment_referral(payments, reward, order.id, topup=False)
+        payments.queue_notice(
+            f"order:{order.id}",
+            order.telegram_id,
+            t("payments.subscription_success")
+            + _receipt_for_transaction(
+                transaction, operation=t("wallet.receipt_subscription")
+            ),
+        )
+        return "confirmed"
+    if order.status != PAID:
+        return "confirmed"
+    if not orders.claim_fulfillment(order.id):
+        return "confirmed"
+    try:
+        plan = _stars_plan(
+            plans, order.plan_code, include_traffic=settings.traffic_plans_enabled
+        )
+        order_term = None if plan is None else _order_plan_term(plan, order)
+        if plan is None or order_term is None:
+            raise OrderConflict("Paid Platega order no longer matches the catalog")
+        updated = await _fulfill_order(
+            order.telegram_id, plan, order_term, panel, settings
+        )
+        if not orders.mark_fulfilled(
+            order.id, payment_completer=wallet.complete_order_payment_locked
+        ):
+            raise OrderStateError("Platega order fulfillment state changed")
+    except (PanelError, OrderError, WalletError, sqlite3.Error):
+        logger.warning("Paid Platega order requires fulfillment review")
+        try:
+            orders.mark_fulfillment_review(order.id)
+            wallet.complete_order_payment(order.id, status="REVIEW")
+        except (OrderError, WalletError, sqlite3.Error):
+            logger.warning("Platega fulfillment review state could not be saved")
+        _queue_platega_review(payments, settings, orders, order.id, order.telegram_id)
+        return "review"
+    transaction = wallet.payment_transaction(order.id)
+    if transaction is None:
+        raise WalletError("Successful Platega order is missing from history")
+    if order.rub_price_minor is not None:
+        reward = wallet.reward_referral_purchase(
+            order.id, order.telegram_id, order.rub_price_minor
+        )
+        _queue_payment_referral(payments, reward, order.id, topup=False)
+    payments.queue_notice(
+        f"order:{order.id}",
+        order.telegram_id,
+        _payment_success_text(plan, order_term, updated)
+        + _receipt_for_transaction(
+            transaction, operation=t("wallet.receipt_subscription")
+        ),
+    )
+    return "confirmed"
+
+
+async def _verify_platega_status(
+    client: PlategaClient, callback_status: TransactionStatus
+) -> TransactionStatus:
+    actual = await client.get_transaction_status(callback_status.transaction_id)
+    if (
+        actual.transaction_id != callback_status.transaction_id
+        or actual.amount != callback_status.amount
+        or actual.currency != callback_status.currency
+        or (
+            callback_status.payload is not None
+            and actual.payload != callback_status.payload
+        )
+    ):
+        raise PlategaProtocolError("Platega callback differs from transaction status")
+    return actual
+
+
+async def _process_platega_check(
+    check: PaymentCheck,
+    *,
+    bot: Bot,
+    panel: RemnawaveClient,
+    settings: Settings,
+    plans: tuple[Plan, ...],
+    orders: OrderStore,
+    wallet: WalletStore,
+    payments: PaymentStore,
+    client: PlategaClient,
+) -> None:
+    try:
+        status = (
+            await _verify_platega_status(client, check.callback)
+            if check.callback is not None
+            else await client.get_transaction_status(check.transaction_id)
+        )
+        result = await _apply_platega_status(
+            status,
+            bot=bot,
+            panel=panel,
+            settings=settings,
+            plans=plans,
+            orders=orders,
+            wallet=wallet,
+            payments=payments,
+        )
+        awaiting_refund = status.status == "CONFIRMED" and (
+            payments.awaiting_refund(check.transaction_id)
+            or (check.callback is not None and check.callback.status == "CHARGEBACKED")
+        )
+        payments.finish_check(check, result, retry=awaiting_refund)
+    except (
+        PlategaError,
+        OrderError,
+        WalletError,
+        PanelError,
+        sqlite3.Error,
+        ValueError,
+    ) as error:
+        logger.warning(
+            "Automatic payment verification deferred for %s (%s)",
+            check.transaction_id, type(error).__name__,
+        )
+        payments.retry_check(check)
+
+
+async def _deliver_payment_notices(bot: Bot, payments: PaymentStore) -> None:
+    for notice in payments.pending_notices():
+        try:
+            if notice.message_id is not None:
+                await bot.edit_message_text(
+                    notice.text,
+                    chat_id=notice.telegram_id,
+                    message_id=notice.message_id,
+                    reply_markup=back_keyboard("user:wallet"),
+                    parse_mode="HTML",
+                )
+            else:
+                await bot.send_message(
+                    notice.telegram_id, notice.text, parse_mode="HTML"
+                )
+        except TelegramRetryAfter as error:
+            payments.retry_notice(notice, delay=error.retry_after)
+        except TelegramForbiddenError:
+            payments.mark_notice_delivered(notice.id)
+        except TelegramBadRequest:
+            if notice.message_id is not None:
+                payments.mark_notice_delivered(notice.id)
+            else:
+                payments.retry_notice(notice)
+        except TelegramAPIError:
+            logger.warning("Payment notification delivery deferred")
+            payments.retry_notice(notice)
+        else:
+            payments.mark_notice_delivered(notice.id)
+
+
+async def platega_payment_iteration(
+    *,
+    bot: Bot,
+    panel: RemnawaveClient,
+    settings: Settings,
+    plans: tuple[Plan, ...],
+    orders: OrderStore,
+    wallet: WalletStore,
+    payments: PaymentStore,
+    client: PlategaClient,
+    deliver_notices: bool = True,
+) -> None:
+    payments.synchronize()
+    semaphore = asyncio.Semaphore(5)
+
+    async def process(check: PaymentCheck) -> None:
+        async with semaphore:
+            await _process_platega_check(
+                check,
+                bot=bot,
+                panel=panel,
+                settings=settings,
+                plans=plans,
+                orders=orders,
+                wallet=wallet,
+                payments=payments,
+                client=client,
+            )
+
+    results = await asyncio.gather(
+        *(process(check) for check in payments.pending_checks()), return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    if deliver_notices:
+        await _deliver_payment_notices(bot, payments)
+
+
+async def payment_notice_loop(
+    bot: Bot, payments: PaymentStore, *, interval_seconds: float = 1,
+) -> None:
+    while True:
+        payments.notices_changed.clear()
+        try:
+            await _deliver_payment_notices(bot, payments)
+        except sqlite3.Error:
+            logger.warning("Payment notification queue is unavailable")
+        try:
+            await asyncio.wait_for(payments.notices_changed.wait(), timeout=interval_seconds)
+        except TimeoutError:
+            pass
+
+
+async def platega_payment_loop(
+    *,
+    bot: Bot,
+    panel: RemnawaveClient,
+    settings: Settings,
+    plans: tuple[Plan, ...],
+    orders: OrderStore,
+    wallet: WalletStore,
+    payments: PaymentStore,
+    client: PlategaClient,
+    interval_seconds: float = 10,
+) -> None:
+    while True:
+        payments.changed.clear()
+        try:
+            await platega_payment_iteration(
+                bot=bot,
+                panel=panel,
+                settings=settings,
+                plans=plans,
+                orders=orders,
+                wallet=wallet,
+                payments=payments,
+                client=client,
+                deliver_notices=False,
+            )
+        except (OrderError, WalletError, sqlite3.Error):
+            logger.warning("Automatic payment reconciliation deferred")
+        try:
+            await asyncio.wait_for(payments.changed.wait(), timeout=interval_seconds)
+        except TimeoutError:
+            pass
+
+
+@router.callback_query(F.data.startswith("platega:check:"))
+async def check_platega_payment(
+    callback: CallbackQuery,
+    bot: Bot,
+    panel: RemnawaveClient,
+    settings: Settings,
+    plans: tuple[Plan, ...],
+    orders: OrderStore,
+    wallet: WalletStore | None = None,
+    platega: PlategaClient | None = None,
+    payments: PaymentStore | None = None,
+) -> None:
+    if callback.message is None or callback.message.chat.type != "private":
+        await callback.answer(t("alert.private_chat"), show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if (
+        len(parts) != 4
+        or parts[2] not in {"order", "topup"}
+        or wallet is None
+        or platega is None
+    ):
+        await callback.answer(t("wallet.unavailable"), show_alert=True)
+        return
+    try:
+        if parts[2] == "topup":
+            topup = wallet.topup(parts[3])
+            if topup.telegram_id != callback.from_user.id:
+                raise WalletConflict("Payment owner does not match")
+            payment_id = topup.provider_payment_id
+        else:
+            order = orders.get(parts[3])
+            if order.telegram_id != callback.from_user.id:
+                raise OrderConflict("Payment owner does not match")
+            payment_id = order.provider_payment_id
+        if not payment_id:
+            await callback.answer(t("platega.payment_pending"), show_alert=True)
+            return
+        payments = payments or PaymentStore(wallet.database_path)
+        payments.wake_check(payment_id)
+    except (OrderError, WalletError, PlategaError, sqlite3.Error):
+        logger.warning("Platega payment status could not be checked")
+        await callback.answer(t("wallet.unavailable"), show_alert=True)
+        return
+    await callback.answer(t("payments.check_queued"))
+
+
+def _platega_web_application(
+    *,
+    bot: Bot,
+    panel: RemnawaveClient,
+    settings: Settings,
+    plans: tuple[Plan, ...],
+    orders: OrderStore,
+    wallet: WalletStore,
+    client: PlategaClient,
+    payments: PaymentStore | None = None,
+) -> web.Application:
+    payments = payments or PaymentStore(wallet.database_path)
+    application = web.Application(client_max_size=64 * 1024)
+
+    async def callback_handler(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            payment = client.validate_callback(request.headers, body)
+        except (PlategaProtocolError, ValueError, web.HTTPBadRequest):
+            raise web.HTTPBadRequest(text="Invalid payment callback") from None
+        except PlategaError:
+            logger.warning("Platega callback validation failed")
+            raise web.HTTPUnauthorized(text="Invalid payment callback") from None
+        try:
+            payments.request_check(payment)
+        except sqlite3.Error:
+            logger.warning("Platega callback could not be persisted")
+            raise web.HTTPServiceUnavailable(text="Payment queue unavailable") from None
+        return web.Response(status=200)
+
+    application.router.add_post("/platega/callback", callback_handler)
+
+    async def health_handler(_request: web.Request) -> web.Response:
+        return web.json_response({"status": "ok"})
+
+    application.router.add_get("/platega/healthz", health_handler)
+    return application
 
 
 @router.message(F.refunded_payment)
@@ -5806,6 +7706,155 @@ async def refund_stars_payment(
             logger.warning("Stars refund notification delivery failed")
 
 
+@router.message(Command("recover_order"))
+async def recover_paid_order(
+    message: Message,
+    bot: Bot,
+    panel: RemnawaveClient,
+    settings: Settings,
+    plans: tuple[Plan, ...],
+    orders: OrderStore,
+    wallet: WalletStore | None = None,
+) -> None:
+    if not _is_admin(message, settings) or not _private_chat(message):
+        await message.answer(t("admin.command_unavailable"))
+        return
+    parts = (message.text or "").split(maxsplit=3)
+    if len(parts) < 3:
+        await message.answer(t("plans.recovery_usage"))
+        return
+    order_id, action = parts[1], parts[2]
+    try:
+        order = orders.get(order_id)
+    except (OrderError, sqlite3.Error):
+        await message.answer(t("plans.recovery_unavailable"))
+        return
+    if (
+        order.status != FULFILLMENT_REVIEW
+        or order.provider != "telegram_stars"
+        or not order.provider_payment_id
+    ):
+        await message.answer(t("plans.recovery_unavailable"))
+        return
+    if action == "refund" and len(parts) == 3:
+        try:
+            user = await _load_user(order.telegram_id, panel)
+            if user is not None and user.status == "ACTIVE":
+                await message.answer(t("plans.refund_active_user"))
+                return
+            if not orders.claim_refund(order.id):
+                await message.answer(t("plans.recovery_unavailable"))
+                return
+            refunded = await bot.refund_star_payment(
+                user_id=order.telegram_id,
+                telegram_payment_charge_id=order.provider_payment_id,
+            )
+            if not refunded:
+                await message.answer(t("plans.refund_unavailable"))
+                return
+            changed = (
+                wallet.refund_order(order.id)
+                if wallet is not None
+                else orders.mark_refunded(order.id)
+            )
+        except (OrderError, PanelError, WalletError, TelegramAPIError, sqlite3.Error):
+            logger.warning("Stars recovery refund requires manual reconciliation")
+            await message.answer(t("plans.refund_unavailable"))
+            return
+        if not changed:
+            await message.answer(t("plans.recovery_unavailable"))
+            return
+        await message.answer(
+            t("plans.refund_done", order_id=escape(order.id)),
+            parse_mode="HTML",
+        )
+        try:
+            await bot.send_message(
+                order.telegram_id,
+                t("plans.refund_user_notice"),
+            )
+        except TelegramAPIError:
+            logger.warning("Stars refund notification delivery failed")
+        return
+    if (
+        action != "retry"
+        or len(parts) != 4
+        or parts[3] != "NOT_FULFILLED"
+        or wallet is None
+    ):
+        await message.answer(t("plans.recovery_usage"))
+        return
+    plan = _stars_plan(
+        plans,
+        order.plan_code,
+        include_traffic=settings.traffic_plans_enabled,
+    )
+    order_term = None if plan is None else _order_plan_term(plan, order)
+    if (
+        plan is None
+        or order_term is None
+        or plan.currency != order.currency
+        or wallet.payment_transaction(order.id) is None
+    ):
+        await message.answer(t("plans.recovery_unavailable"))
+        return
+    await message.answer(t("plans.recovery_retry_warning"))
+    if not orders.claim_recovery_retry(order.id):
+        await message.answer(t("plans.recovery_unavailable"))
+        return
+    try:
+        updated = await _fulfill_order(
+            order.telegram_id, plan, order_term, panel, settings
+        )
+        if not orders.mark_fulfilled(
+            order.id,
+            payment_completer=wallet.complete_order_payment_locked,
+        ):
+            raise OrderStateError("Stars order fulfillment state changed")
+        transaction = wallet.payment_transaction(order.id)
+        if transaction is None:
+            raise WalletError("Successful Stars payment is missing")
+    except (OrderError, PanelError, WalletError, sqlite3.Error):
+        logger.warning("Paid order recovery requires manual review")
+        try:
+            orders.mark_fulfillment_review(order.id)
+        except (OrderError, sqlite3.Error):
+            logger.warning("Paid order review state could not be saved")
+        try:
+            wallet.complete_order_payment(order.id, status="REVIEW")
+        except (WalletError, sqlite3.Error):
+            logger.warning("Recovered payment review state could not be saved")
+        await message.answer(t("plans.recovery_retry_failed"))
+        return
+    if order.rub_price_minor is not None:
+        try:
+            reward = wallet.reward_referral_purchase(
+                order.id, order.telegram_id, order.rub_price_minor
+            )
+        except (WalletError, sqlite3.Error):
+            logger.warning("Recovered referral reward requires reconciliation")
+        else:
+            try:
+                await _notify_referral_reward(bot, reward, topup=False)
+            except TelegramAPIError:
+                logger.warning("Recovered referral reward notification failed")
+    try:
+        await bot.send_message(
+            order.telegram_id,
+            _payment_success_text(plan, order_term, updated)
+            + _receipt_for_transaction(
+                transaction, operation=t("wallet.receipt_subscription")
+            ),
+            parse_mode="HTML",
+        )
+    except TelegramAPIError:
+        logger.warning("Recovered purchase notification delivery failed")
+    await message.answer(
+        t("plans.recovery_retry_done", order_id=escape(order.id)),
+        parse_mode="HTML",
+    )
+
+
 @router.message(F.text.startswith("/"))
 async def unknown_command(message: Message, settings: Settings) -> None:
     if _private_chat(message):
@@ -5849,6 +7898,13 @@ async def main() -> None:
         await bot.session.close()
         raise SystemExit(2) from error
     try:
+        promotions = PromotionStore(settings.state_db_path or "bot-state.sqlite3")
+    except PromotionStoreError as error:
+        logger.error("Cannot start without promotion storage: %s", error)
+        await panel.close()
+        await bot.session.close()
+        raise SystemExit(2) from error
+    try:
         orders = OrderStore(settings.state_db_path or "bot-state.sqlite3")
     except (OSError, sqlite3.Error) as error:
         logger.error("Cannot start without payment order storage: %s", error)
@@ -5862,6 +7918,32 @@ async def main() -> None:
         await panel.close()
         await bot.session.close()
         raise SystemExit(2) from error
+    try:
+        broadcasts = BroadcastStore(settings.state_db_path or "bot-state.sqlite3")
+    except (OSError, BroadcastError, sqlite3.Error) as error:
+        logger.error("Cannot start without broadcast storage: %s", error)
+        await panel.close()
+        await bot.session.close()
+        raise SystemExit(2) from error
+    platega = (
+        PlategaClient(settings.platega_merchant_id, settings.platega_secret)
+        if settings.platega_enabled
+        and settings.platega_merchant_id is not None
+        and settings.platega_secret is not None
+        else None
+    )
+    try:
+        payments = PaymentStore(settings.state_db_path or "bot-state.sqlite3")
+    except sqlite3.Error as error:
+        logger.error("Cannot start without payment tracking storage")
+        if platega is not None:
+            await platega.close()
+        await panel.close()
+        await bot.session.close()
+        raise SystemExit(2) from error
+    platega_runner: web.AppRunner | None = None
+    platega_payment_task: asyncio.Task | None = None
+    payment_notice_task: asyncio.Task | None = None
     configure_screens(prefs)
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.errors.register(_handle_stale_callback_query_error)
@@ -5898,10 +7980,40 @@ async def main() -> None:
         name="traffic-threshold-notifications",
     )
     channel_post_task = asyncio.create_task(
-        channel_post_preview_loop(bot, tickets),
+        channel_post_preview_loop(bot, tickets, promotions),
         name="channel-post-previews",
     )
     try:
+        if platega is not None:
+            platega_app = _platega_web_application(
+                bot=bot,
+                panel=panel,
+                settings=settings,
+                plans=plans,
+                orders=orders,
+                wallet=wallet,
+                client=platega,
+                payments=payments,
+            )
+            platega_runner = web.AppRunner(platega_app, access_log=None)
+            await platega_runner.setup()
+            await web.TCPSite(platega_runner, "0.0.0.0", 8081).start()
+            platega_payment_task = asyncio.create_task(
+                platega_payment_loop(
+                    bot=bot,
+                    panel=panel,
+                    settings=settings,
+                    plans=plans,
+                    orders=orders,
+                    wallet=wallet,
+                    payments=payments,
+                    client=platega,
+                ),
+                name="platega-payment-reconciliation",
+            )
+            payment_notice_task = asyncio.create_task(
+                payment_notice_loop(bot, payments), name="platega-payment-notifications",
+            )
         await bot.set_my_commands(
             [
                 BotCommand(command="start", description="Главное меню"),
@@ -5929,8 +8041,12 @@ async def main() -> None:
             plans=plans,
             prefs=prefs,
             tickets=tickets,
+            promotions=promotions,
             orders=orders,
             wallet=wallet,
+            broadcasts=broadcasts,
+            platega=platega,
+            payments=payments,
             allowed_updates=dispatcher.resolve_used_update_types(),
         )
     except TelegramAPIError as error:
@@ -5946,6 +8062,10 @@ async def main() -> None:
         traffic_notification_task.cancel()
         channel_post_task.cancel()
         trial_nudge_task.cancel()
+        if platega_payment_task is not None:
+            platega_payment_task.cancel()
+        if payment_notice_task is not None:
+            payment_notice_task.cancel()
         for task in (
             reminder_task,
             trial_nudge_task,
@@ -5956,11 +8076,17 @@ async def main() -> None:
             free_access_task,
             traffic_notification_task,
             channel_post_task,
+            *((platega_payment_task,) if platega_payment_task is not None else ()),
+            *((payment_notice_task,) if payment_notice_task is not None else ()),
         ):
             try:
                 await task
             except asyncio.CancelledError:
                 pass
+        if platega_runner is not None:
+            await platega_runner.cleanup()
+        if platega is not None:
+            await platega.close()
         await panel.close()
         await bot.session.close()
 

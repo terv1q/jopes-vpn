@@ -22,6 +22,10 @@
 		X-Content-Type-Options "nosniff"
 		Referrer-Policy "no-referrer"
 	}
+	@platega path /platega/callback /platega/healthz
+	handle @platega {
+		reverse_proxy bot:8081
+	}
 	@support path /support /support/*
 	handle @support {
 		reverse_proxy ticket-forum:8080 {

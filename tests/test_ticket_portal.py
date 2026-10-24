@@ -208,7 +208,7 @@ class TicketPortalTests(unittest.TestCase):
             f"--{boundary}\r\n"
             'Content-Disposition: form-data; name="photo"; filename="post.png"\r\n'
             "Content-Type: image/png\r\n\r\n"
-        ).encode("utf-8") + b"\x89PNG\r\n\x1a\n" + (
+        ).encode() + b"\x89PNG\r\n\x1a\n" + (
             f"\r\n--{boundary}--\r\n"
         ).encode("ascii")
         status, _, _ = self.request(
@@ -249,8 +249,8 @@ class TicketPortalTests(unittest.TestCase):
         for index in range(55):
             self.store.add_message(
                 self.ticket_id,
-                101,
-                "user",
+                900,
+                "admin",
                 f"History message {index}",
             )
 
