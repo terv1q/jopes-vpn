@@ -4,12 +4,13 @@ import argparse
 import asyncio
 import logging
 import time
+from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
-from aiohttp import web
+if TYPE_CHECKING:
+    from aiogram import Bot
+    from aiohttp import web
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,8 @@ class BotHealth:
         )
 
     async def handler(self, _request: web.Request) -> web.Response:
+        from aiohttp import web
+
         healthy = self.healthy()
         return web.json_response(
             {
@@ -47,6 +50,8 @@ class BotHealth:
         )
 
     async def probe(self, bot: Bot) -> None:
+        from aiogram.exceptions import TelegramAPIError
+
         while True:
             try:
                 await bot.get_me()
