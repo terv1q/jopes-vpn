@@ -326,6 +326,26 @@ The bot exposes `/healthz` on its existing internal port `8081`; Caddy publishes
 
 ## Domain templates
 
+Owner operations are configured with `BOT_OWNER_ID` and `OPS_*` in `.env.example`.
+Run `python3 install-user-operations.py` as the existing deployment user to install
+the five-minute monitor and expired-test cleanup without sudo. Only that owner
+receives operational notifications. Critical failures/recoveries are deduplicated;
+noncritical signals appear in a daily summary at 07:00 UTC. Tickets waiting more
+than two hours receive one reminder per latest unanswered message.
+
+The external monitor runs in the public source repository's default-branch
+`service-monitor` workflow. Encrypted recovery artifacts and the runbook are in a
+separate private repository. Setup uses dedicated SSH keys with forced allowlists,
+never the personal deployment key. See [RECOVERY.md](RECOVERY.md) for verification,
+retention and the remaining full-host disaster rehearsal. GitHub cron can be delayed.
+Keep Windows monitoring passive once these checks are enabled to avoid duplicate alerts.
+
+`/service`, `/privacy_process` and `/payment_check_status` are private owner commands.
+`/delete_data` creates an idempotent request; it does not cancel VPN access or erase
+financial records automatically. The `/payment_check` owner command prepares or
+renews expired control invoices; automatic refunds are restricted to this flow.
+Legal drafts must be reviewed before setting document URLs in the existing admin menu.
+
 Set `APEX_DOMAIN`, `PANEL_DOMAIN`, `CONNECT_DOMAIN` and `TRIAL_CHANNEL_USERNAME` in the existing production environment file. Caddy uses those variables directly. Validate Compose with `config --quiet`; avoid printing expanded configuration because it contains secrets.
 
 The Hysteria inbound is a template. Render to a separate, ignored output before a future profile update:

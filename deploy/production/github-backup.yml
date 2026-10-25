@@ -1,0 +1,74 @@
+name: encrypted-recovery
+on:
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_dispatch:
+    inputs:
+      verify_postgres:
+        description: Restore PostgreSQL into an isolated temporary database
+        required: false
+        default: 'false'
+permissions:
+  contents: read
+concurrency:
+  group: encrypted-recovery
+  cancel-in-progress: false
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      JOPES_BACKUP_SECRET: ${{ secrets.JOPES_BACKUP_SECRET }}
+      JOPES_BACKUP_SSH_KEY: ${{ secrets.JOPES_BACKUP_SSH_KEY }}
+      JOPES_SSH_HOST: ${{ secrets.JOPES_SSH_HOST }}
+      JOPES_SSH_USER: ${{ secrets.JOPES_SSH_USER }}
+      JOPES_SSH_PORT: ${{ secrets.JOPES_SSH_PORT }}
+      JOPES_SSH_KNOWN_HOSTS: ${{ secrets.JOPES_SSH_KNOWN_HOSTS }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Export and verify encrypted backup
+        env:
+          VERIFY_POSTGRES: ${{ inputs.verify_postgres }}
+        run: |
+          extra=""
+          if [ "$VERIFY_POSTGRES" = true ] || [ "$(date -u +%w%H)" = 003 ]; then extra="--verify-postgres"; fi
+          python3 deploy/production/cloud-backup.py backup output $extra
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recovery-hourly-${{ github.run_id }}
+          path: |
+            output/*.enc
+            output/*.hmac
+          retention-days: 2
+          if-no-files-found: error
+      - name: Select daily and weekly snapshots
+        id: rotation
+        run: |
+          echo "daily=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+          echo "weekly=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+          echo "daily_due=true" >> "$GITHUB_OUTPUT"
+          if [ "$(date -u +%w)" = 0 ]; then echo "weekly_due=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/upload-artifact@v4
+        if: steps.rotation.outputs.daily_due == 'true'
+        with:
+          name: recovery-daily-${{ steps.rotation.outputs.daily }}
+          path: output/*
+          retention-days: 14
+          overwrite: true
+      - uses: actions/upload-artifact@v4
+        if: steps.rotation.outputs.weekly_due == 'true'
+        with:
+          name: recovery-weekly-${{ steps.rotation.outputs.weekly }}
+          path: output/*
+          retention-days: 56
+          overwrite: true
+      - name: Confirm off-host upload to production
+        run: python3 deploy/production/cloud-backup.py ack output
+      - name: Record backup failure
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          s=importlib.util.spec_from_file_location('cloud','deploy/production/cloud-backup.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+          m.ssh(m.configure_ssh('backup'),'backup-failed')
+          PY

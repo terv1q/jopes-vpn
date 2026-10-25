@@ -177,6 +177,29 @@ def export(root: Path, *, verify_restore: bool = False) -> None:
         for required in (".env", ".env.node", "Caddyfile", "docker-compose.yml"):
             if not (staging / "config" / required).is_file():
                 raise RuntimeError("Required recovery configuration is missing")
+        for source, name in (
+            (root / "jopesvpn" / "plans.json", "plans.json"),
+            (root / "RELEASE_COMMIT", "RELEASE_COMMIT"),
+        ):
+            if source.is_file():
+                (staging / "config" / name).write_bytes(source.read_bytes())
+        for name in (
+            "RECOVERY.md",
+            "PRIVACY_DRAFT.md",
+            "AGREEMENT_DRAFT.md",
+            "HAPP_CHECKLIST.md",
+            "SERVICE_REPORT.md",
+            "PLAN_TAG_AUDIT.md",
+        ):
+            source = (
+                (deploy / name)
+                if name == "RECOVERY.md"
+                else root / "docs" / "service-reliability" / name
+            )
+            if source.is_file():
+                target = staging / "instructions" / name
+                target.parent.mkdir(exist_ok=True)
+                target.write_bytes(source.read_bytes())
         files = sorted(path for path in staging.rglob("*") if path.is_file())
         manifest = {
             "format": "jopesvpn-recovery-v1",

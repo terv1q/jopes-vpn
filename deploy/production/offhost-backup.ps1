@@ -6,7 +6,7 @@ param(
     [string]$SshHost = "jopesvpn",
     [string]$RemoteRoot = "/opt/jopesvpn",
     [string]$OpenSslPath,
-    [int]$RetentionDays = 90
+    [int]$RetentionDays = 14
 )
 
 $ErrorActionPreference = "Stop"

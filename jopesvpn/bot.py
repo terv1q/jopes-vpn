@@ -104,6 +104,9 @@ from jopesvpn.panel import (
     PanelUser,
     RemnawaveClient,
 )
+from jopesvpn.payment_check import PaymentCheckStore
+from jopesvpn.payment_check import loop as payment_check_loop
+from jopesvpn.payment_check import router as payment_check_router
 from jopesvpn.payments import PaymentCheck, PaymentStore
 from jopesvpn.plans import (
     Plan,
@@ -147,6 +150,8 @@ from jopesvpn.promotions import (
 )
 from jopesvpn.screens import answer_screen, edit_screen
 from jopesvpn.screens import configure as configure_screens
+from jopesvpn.service_ops import ServiceOpsStore, service_loop
+from jopesvpn.service_ui import router as service_router
 from jopesvpn.ticket_ui import (
     ADMIN_TICKETS_PER_PAGE,
     TICKET_MESSAGES_PER_PAGE,
@@ -4876,6 +4881,7 @@ async def _run_trial(
     panel: RemnawaveClient,
     settings: Settings,
     prefs: PreferencesStore | None = None,
+    service_ops: ServiceOpsStore | None = None,
 ) -> None:
     assert callback.from_user is not None
     telegram_id = callback.from_user.id
@@ -4884,6 +4890,8 @@ async def _run_trial(
         return
     try:
         if prefs.trial_was_used(telegram_id):
+            if service_ops is not None:
+                service_ops.repeated_trial(telegram_id, settings.service_policy.repeat_trial_threshold)
             await _edit_or_send(callback, t("trial.unavailable_generic"), back_keyboard())
             return
     except PreferencesError:
@@ -5045,13 +5053,14 @@ async def trial_check(
     settings: Settings,
     state: FSMContext | None = None,
     prefs: PreferencesStore | None = None,
+    service_ops: ServiceOpsStore | None = None,
 ) -> None:
     if callback.message is None or callback.message.chat.type != "private":
         await callback.answer(t("alert.private_chat"), show_alert=True)
         return
     await _clear_state(state)
     await callback.answer()
-    await _run_trial(callback, bot, panel, settings, prefs)
+    await _run_trial(callback, bot, panel, settings, prefs, service_ops)
 
 
 router.include_router(admin_router)
@@ -7715,7 +7724,7 @@ async def payment_support(
     order_ref = latest_order.id if latest_order is not None else t("common.dash")
     await message.answer(
         f"<b>{t('plans.payment_support_title')}</b>\n\n"
-        f"{t('plans.payment_support', order_id=escape(order_ref))}",
+        f"{t('plans.payment_support', order_id=escape(order_ref))}\n\n{t('support.refund_policy')}",
         reply_markup=help_keyboard(support_url(settings.support_contact)),
         parse_mode="HTML",
     )
@@ -7937,6 +7946,10 @@ async def recover_paid_order(
     )
 
 
+router.include_router(service_router)
+router.include_router(payment_check_router)
+
+
 @router.message(F.text.startswith("/"))
 async def unknown_command(message: Message, settings: Settings) -> None:
     if _private_chat(message):
@@ -8036,6 +8049,9 @@ async def main() -> None:
         max_age=settings.health_probe_max_age_seconds,
     )
     health_task = asyncio.create_task(health.probe(bot), name="telegram-health-probe")
+    service_ops = ServiceOpsStore(settings.state_db_path or "bot-state.sqlite3")
+    service_task = asyncio.create_task(service_loop(settings, service_ops, panel, prefs), name="service-review")
+    payment_check_task = asyncio.create_task(payment_check_loop(bot, settings, wallet, platega, PaymentCheckStore(settings.state_db_path or "bot-state.sqlite3")), name="control-payment-check")
     platega_payment_task: asyncio.Task | None = None
     payment_notice_task: asyncio.Task | None = None
     configure_screens(prefs)
@@ -8128,6 +8144,7 @@ async def main() -> None:
                 BotCommand(command="cooperation", description="Сотрудничество"),
                 BotCommand(command="about", description="О сервисе"),
                 BotCommand(command="promo", description="Активировать промокод"),
+                BotCommand(command="delete_data", description="Запросить удаление данных"),
                 BotCommand(command="paysupport", description="Помощь с оплатой"),
                 BotCommand(command="help", description="Помощь"),
             ]
@@ -8146,6 +8163,7 @@ async def main() -> None:
             orders=orders,
             wallet=wallet,
             promo_codes=promo_codes,
+            service_ops=service_ops,
             broadcasts=broadcasts,
             platega=platega,
             payments=payments,
@@ -8157,6 +8175,8 @@ async def main() -> None:
     finally:
         health.ready = False
         health_task.cancel()
+        service_task.cancel()
+        payment_check_task.cancel()
         reminder_task.cancel()
         connection_task.cancel()
         ticket_followup_task.cancel()
@@ -8172,6 +8192,8 @@ async def main() -> None:
             payment_notice_task.cancel()
         for task in (
             health_task,
+            service_task,
+            payment_check_task,
             reminder_task,
             trial_nudge_task,
             connection_task,

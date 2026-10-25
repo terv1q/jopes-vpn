@@ -1,0 +1,43 @@
+name: verify-stored-recovery
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_id:
+        description: Encrypted recovery artifact ID from this repository
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve the stored backup run
+        id: stored
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from urllib.request import Request, urlopen
+          artifact = int(os.environ['ARTIFACT_ID'])
+          request = Request('https://api.github.com/repos/' + os.environ['REPOSITORY'] + '/actions/artifacts/' + str(artifact), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urlopen(request, timeout=30) as response:
+              data = json.load(response)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('run_id=' + str(data['workflow_run']['id']) + '\n')
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ inputs.artifact_id }}
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.stored.outputs.run_id }}
+          path: downloaded
+      - name: Verify HMAC, decrypt and validate stored archive
+        env:
+          JOPES_BACKUP_SECRET: ${{ secrets.JOPES_BACKUP_SECRET }}
+        run: python3 deploy/production/cloud-backup.py verify downloaded --verify-postgres

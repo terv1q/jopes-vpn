@@ -55,6 +55,41 @@ class PromoPolicy:
 
 
 @dataclass(frozen=True)
+class ServicePolicy:
+    poll_seconds: int = 300
+    device_scan_seconds: int = 3600
+    support_reminder_hours: int = 2
+    repeat_trial_threshold: int = 3
+    referral_daily_threshold: int = 5
+    ticket_retention_days: int = 90
+    event_retention_days: int = 30
+    summary_hour_utc: int = 7
+
+    @classmethod
+    def from_env(cls) -> ServicePolicy:
+        defaults = cls()
+        try:
+            result = cls(**{
+                key: int(os.environ.get(f"OPS_{key.upper()}", str(value)))
+                for key, value in vars(defaults).items()
+            })
+        except ValueError as error:
+            raise ConfigurationError("OPS limits must be integers") from error
+        if (
+            not 60 <= result.poll_seconds <= 3600
+            or not 300 <= result.device_scan_seconds <= 86400
+            or not 1 <= result.support_reminder_hours <= 168
+            or not 2 <= result.repeat_trial_threshold <= 100
+            or not 2 <= result.referral_daily_threshold <= 10000
+            or not 1 <= result.ticket_retention_days <= 3650
+            or not 1 <= result.event_retention_days <= 365
+            or not 0 <= result.summary_hour_utc <= 23
+        ):
+            raise ConfigurationError("OPS limits are out of range")
+        return result
+
+
+@dataclass(frozen=True)
 class Settings:
     bot_token: str
     panel_api_url: str
@@ -82,6 +117,13 @@ class Settings:
     promo_policy: PromoPolicy = PromoPolicy()
     health_probe_interval_seconds: int = 60
     health_probe_max_age_seconds: int = 180
+    service_policy: ServicePolicy = ServicePolicy()
+
+    @property
+    def service_owner_id(self) -> int | None:
+        if self.owner_telegram_id is not None:
+            return self.owner_telegram_id
+        return next(iter(self.admin_telegram_ids)) if len(self.admin_telegram_ids) == 1 else None
 
     @property
     def platega_enabled(self) -> bool:
@@ -354,5 +396,6 @@ class Settings:
             promo_policy=PromoPolicy.from_env(),
             health_probe_interval_seconds=health_interval,
             health_probe_max_age_seconds=health_max_age,
+            service_policy=ServicePolicy.from_env(),
             **resource_urls,
         )

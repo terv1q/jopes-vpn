@@ -1,0 +1,30 @@
+name: external-service-monitor
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: service-monitor
+  cancel-in-progress: false
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: monitor-state.json
+          key: service-monitor-state-${{ github.run_id }}
+          restore-keys: service-monitor-state-
+      - name: Check service and notify owner
+        env:
+          JOPES_MONITOR_CONFIG: ${{ secrets.JOPES_MONITOR_CONFIG }}
+          JOPES_MONITOR_SSH_KEY: ${{ secrets.JOPES_MONITOR_SSH_KEY }}
+          JOPES_SSH_HOST: ${{ secrets.JOPES_SSH_HOST }}
+          JOPES_SSH_USER: ${{ secrets.JOPES_SSH_USER }}
+          JOPES_SSH_PORT: ${{ secrets.JOPES_SSH_PORT }}
+          JOPES_SSH_KNOWN_HOSTS: ${{ secrets.JOPES_SSH_KNOWN_HOSTS }}
+        run: python3 deploy/production/cloud-monitor.py
