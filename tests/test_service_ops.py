@@ -11,6 +11,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from aiogram import Bot, Dispatcher
+from aiogram.types import Chat, Message, Update, User
+
 from jopesvpn.config import ConfigurationError, ServicePolicy, Settings
 from jopesvpn.payment_check import PaymentCheckStore, check_once, prepare
 from jopesvpn.payments import PaymentStore
@@ -271,6 +274,50 @@ class PolicyTests(unittest.TestCase):
 
 
 class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_service_commands_bypass_existing_fsm_and_unknown_command(self):
+        from jopesvpn.bot import (
+            TicketFlow,
+            payment_check_router,
+            router,
+            service_router,
+        )
+
+        dispatcher = Dispatcher()
+        dispatcher.include_routers(service_router, payment_check_router, router)
+        bot = Bot("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+        bot.session = AsyncMock()
+        store = MagicMock()
+        store.request_erasure.return_value = 7
+        store.pending.return_value = []
+        context = dispatcher.fsm.get_context(bot=bot, chat_id=1, user_id=1)
+        await context.set_state(TicketFlow.awaiting_user_reply)
+        with tempfile.TemporaryDirectory() as directory:
+            wallet = WalletStore(Path(directory) / "state")
+            for index, command in enumerate(
+                ("/delete_data", "/service", "/payment_check_status"), 1
+            ):
+                message = Message(
+                    message_id=index,
+                    date=datetime.now(UTC),
+                    chat=Chat(id=1, type="private"),
+                    from_user=User(id=1, is_bot=False, first_name="Owner"),
+                    text=command,
+                )
+                await dispatcher.feed_update(
+                    bot,
+                    Update(update_id=index, message=message),
+                    settings=settings(),
+                    wallet=wallet,
+                    service_ops=store,
+                )
+        store.request_erasure.assert_called_once_with(1)
+        store.pending.assert_called_once()
+        texts = [call.args[1].text for call in bot.session.await_args_list]
+        self.assertTrue(
+            any("Stars" not in text and "Контрольные платежи" in text for text in texts)
+        )
+        await dispatcher.storage.close()
+
     async def test_stars_success_reverses_real_wallet_once(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state"

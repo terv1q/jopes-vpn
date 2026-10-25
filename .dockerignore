@@ -19,3 +19,11 @@ bot_research
 test.py
 OpenCode.md
 BOT_IMPROVEMENTS.md
+
+# Protected operations data must not enter the Docker build context.
+backups
+releases
+operations-state
+service-release.tar
+RELEASE_MANIFEST.json
+.ruff_cache

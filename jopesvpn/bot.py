@@ -7946,10 +7946,6 @@ async def recover_paid_order(
     )
 
 
-router.include_router(service_router)
-router.include_router(payment_check_router)
-
-
 @router.message(F.text.startswith("/"))
 async def unknown_command(message: Message, settings: Settings) -> None:
     if _private_chat(message):
@@ -8058,7 +8054,7 @@ async def main() -> None:
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.errors.register(_handle_stale_callback_query_error)
     dispatcher.update.outer_middleware(LanguageMiddleware(prefs))
-    dispatcher.include_router(router)
+    dispatcher.include_routers(service_router, payment_check_router, router)
     reminder_task = asyncio.create_task(
         reminder_loop(bot, panel, prefs), name="expiry-reminders"
     )
@@ -8223,7 +8219,7 @@ async def check_telegram() -> None:
     plans = load_plans(settings.plans_file)
     bot = _new_bot(settings.bot_token)
     dispatcher = Dispatcher(storage=MemoryStorage())
-    dispatcher.include_router(router)
+    dispatcher.include_routers(service_router, payment_check_router, router)
     try:
         await bot.get_me()
         handlers = (
@@ -8231,6 +8227,8 @@ async def check_telegram() -> None:
             + len(router.callback_query.handlers)
             + len(admin_router.message.handlers)
             + len(admin_router.callback_query.handlers)
+            + len(service_router.message.handlers)
+            + len(payment_check_router.message.handlers)
         )
         print(
             "Telegram Bot API: OK; "
