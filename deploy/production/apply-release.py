@@ -65,6 +65,8 @@ def apply(archive: Path, revision: str) -> dict:
         destination = ROOT / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, destination)
+        if destination.suffix in (".sh", ".service", ".timer"):
+            destination.write_bytes(destination.read_bytes().replace(b"\r\n", b"\n"))
         destination.chmod(0o755 if destination.suffix == ".sh" else 0o644)
     env_path = DEPLOY / ".env"
     env_text = env_path.read_text()
