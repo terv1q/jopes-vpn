@@ -8,6 +8,7 @@ from contextlib import closing
 from pathlib import Path
 
 from jopesvpn.orders import (
+    CANCELLED,
     FULFILLED,
     FULFILLMENT_REVIEW,
     PAID,
@@ -316,6 +317,83 @@ class OrderStoreTests(unittest.TestCase):
         self.assertEqual(legacy.amount_minor, 10)
         self.assertIsNone(legacy.term_days)
         self.assertIsNone(legacy.rub_price_minor)
+
+    def test_stale_cleanup_cancels_only_unpaid_orders_without_payment_id(self):
+        selected_plan = next(item for item in load_plans() if item.sellable)
+        term = selected_plan.term_for(7)
+        stale = self.store.create_order(12345, selected_plan, term, now="2026-01-01T12:00:00Z")
+        fresh = self.store.create_order(12346, selected_plan, term, now="2026-01-01T12:00:01Z")
+        linked = self.store.create_order(
+            12347, selected_plan, term, provider="platega", now="2026-01-01T00:00:00Z"
+        )
+        self.store.save_payment_link(linked.id, "linked-payment", "https://pay.example.test/checkout")
+        paid = self.store.create_order(12348, selected_plan, term, now="2026-01-01T00:00:00Z")
+        self.store.confirm_payment(
+            paid.id, provider="telegram_stars", provider_payment_id="paid-payment",
+            amount_minor=paid.amount_minor, currency=paid.currency,
+        )
+        review = self.store.create_order(12349, selected_plan, term, now="2026-01-01T00:00:00Z")
+        self.store.confirm_payment(
+            review.id, provider="telegram_stars", provider_payment_id="review-payment",
+            amount_minor=review.amount_minor, currency=review.currency,
+        )
+        self.store.mark_fulfillment_review(review.id)
+        self.assertEqual(self.store.cancel_stale_pending(now="2026-01-02T17:00:00+05:00"), 1)
+        for order, status in (
+            (stale, CANCELLED), (fresh, PENDING), (linked, PENDING),
+            (paid, PAID), (review, FULFILLMENT_REVIEW),
+        ):
+            with self.subTest(order=order.id):
+                self.assertEqual(self.store.get(order.id).status, status)
+        self.assertEqual(self.store.cancel_stale_pending(now="2026-01-02T12:00:00Z"), 0)
+
+    def test_stale_cleanup_validates_ttl_and_timestamp(self):
+        for ttl in (0, -1, 60 * 24 * 365 + 1):
+            with self.subTest(ttl=ttl), self.assertRaises(ValueError):
+                self.store.cancel_stale_pending(ttl_minutes=ttl)
+        with self.assertRaises(ValueError):
+            self.store.cancel_stale_pending(now="not-a-timestamp")
+
+    def test_late_stars_payment_is_persisted_once_for_manual_review(self):
+        selected_plan = next(item for item in load_plans() if item.sellable)
+        order = self.store.create_order(
+            12345, selected_plan, selected_plan.term_for(7), now="2026-01-01T00:00:00Z"
+        )
+        self.store.cancel_stale_pending(now="2026-01-02T00:00:00Z")
+        confirmed, changed = self.store.confirm_payment(
+            order.id, provider="telegram_stars", provider_payment_id="late-payment",
+            amount_minor=order.amount_minor, currency=order.currency,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(confirmed.status, FULFILLMENT_REVIEW)
+        self.assertEqual(confirmed.provider_payment_id, "late-payment")
+        self.assertIsNotNone(confirmed.paid_at)
+        self.assertFalse(self.store.claim_fulfillment(order.id))
+        duplicate, changed = self.store.confirm_payment(
+            order.id, provider="telegram_stars", provider_payment_id="late-payment",
+            amount_minor=order.amount_minor, currency=order.currency,
+        )
+        self.assertFalse(changed)
+        self.assertEqual(duplicate, confirmed)
+        self.assertEqual(self.store.pending_review_notifications(), [confirmed])
+
+    def test_late_payment_recording_failure_rolls_back_order_confirmation(self):
+        order = self.store.create_order(12345, plan(), now="2026-01-01T00:00:00Z")
+        self.store.cancel_stale_pending(now="2026-01-02T00:00:00Z")
+
+        def fail_recording(connection, confirmed):
+            raise RuntimeError("Recording failed")
+
+        with self.assertRaises(RuntimeError):
+            self.store.confirm_payment(
+                order.id, provider="telegram_stars", provider_payment_id="late-payment",
+                amount_minor=order.amount_minor, currency=order.currency,
+                payment_recorder=fail_recording,
+            )
+        unchanged = self.store.get(order.id)
+        self.assertEqual(unchanged.status, CANCELLED)
+        self.assertIsNone(unchanged.provider_payment_id)
+        self.assertIsNone(unchanged.paid_at)
 
 
 if __name__ == "__main__":

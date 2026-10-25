@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -23,14 +24,20 @@ from jopesvpn.bot import (
     _platega_web_application,
     payment_notice_loop,
     platega_payment_iteration,
+    process_stars_payment,
     topup_navigation,
 )
 from jopesvpn.config import Settings
-from jopesvpn.orders import FULFILLED, OrderStore
+from jopesvpn.orders import FULFILLED, FULFILLMENT_REVIEW, OrderStore
 from jopesvpn.panel import PanelError
 from jopesvpn.payments import PaymentStore
 from jopesvpn.plans import load_plans, stars_for_rub_amount
-from jopesvpn.platega import PlategaClient, PlategaProtocolError, TransactionStatus
+from jopesvpn.platega import (
+    PlategaClient,
+    PlategaError,
+    PlategaProtocolError,
+    TransactionStatus,
+)
 from jopesvpn.preferences import PreferencesStore
 from jopesvpn.ui import topup_methods_keyboard
 from jopesvpn.wallet import MIN_TOPUP_MINOR, WalletStore
@@ -202,6 +209,103 @@ class PaymentProcessingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.wallet.account(1001).balance_minor, MIN_TOPUP_MINOR)
         self.assertEqual(self.requests[0].url.path, f"/transaction/{transaction_id}")
 
+    async def test_payer_commission_credits_quoted_topup_once_for_gross_and_net_callbacks(self):
+        topup, transaction_id = self.topup()
+        self.responses[transaction_id].update(
+            paymentDetails={"amount": 1.08, "currency": "RUB"},
+            comission=0.08,
+            comissionType=1,
+        )
+        await self.post_callback(transaction_id, amount=1.08)
+        await self.iterate()
+        await self.post_callback(transaction_id, amount=1)
+        await self.iterate()
+        self.assertEqual(self.wallet.account(1001).balance_minor, 100)
+        self.assertEqual(self.wallet.topup(topup.id).status, "CREDITED")
+        self.assertEqual(self.wallet.payment_transaction(topup.id).rub_amount_minor, 100)
+        self.bot.send_message.assert_awaited_once()
+
+    async def test_pending_crypto_quote_with_separate_fee_keeps_automatic_polling(self):
+        topup, transaction_id = self.topup()
+        self.responses[transaction_id].update(
+            status="PENDING",
+            paymentDetails={"amount": 1, "currency": "RUB"},
+            comission=0.05,
+            comissionType=1,
+        )
+        await self.iterate()
+        checks = self.payments.pending_checks(now=time.time() + 100)
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0].attempts, 0)
+        self.assertEqual(self.wallet.topup(topup.id).status, "PENDING")
+        self.assertEqual(self.wallet.account(1001).balance_minor, 0)
+        self.bot.send_message.assert_not_awaited()
+
+    async def test_confirmed_quote_with_separate_fee_credits_once_for_gross_callback(self):
+        topup, transaction_id = self.topup()
+        self.responses[transaction_id].update(
+            paymentDetails={"amount": 1, "currency": "RUB"},
+            comission=0.05,
+            comissionType=1,
+        )
+        await self.post_callback(transaction_id, amount=1.05)
+        await self.iterate()
+        await self.post_callback(transaction_id, amount=1)
+        await self.iterate()
+        self.assertEqual(self.wallet.topup(topup.id).status, "CREDITED")
+        self.assertEqual(self.wallet.account(1001).balance_minor, 100)
+        self.bot.send_message.assert_awaited_once()
+
+    async def test_merchant_commission_does_not_reduce_quoted_topup_credit(self):
+        topup, transaction_id = self.topup()
+        self.responses[transaction_id].update(comission=0.08, comissionType=0)
+        await self.post_callback(transaction_id)
+        await self.iterate()
+        self.assertEqual(self.wallet.account(1001).balance_minor, 100)
+        self.assertEqual(self.wallet.topup(topup.id).status, "CREDITED")
+
+    async def test_payer_commission_does_not_hide_a_wrong_order_amount(self):
+        _, transaction_id = self.topup()
+        self.responses[transaction_id].update(
+            paymentDetails={"amount": 1.08, "currency": "RUB"},
+            comission=0.07,
+            comissionType=1,
+        )
+        await self.post_callback(transaction_id, amount=1.08)
+        await self.iterate()
+        self.assertEqual(self.wallet.account(1001).balance_minor, 0)
+        self.bot.send_message.assert_not_awaited()
+
+    async def test_canceled_legacy_invoice_with_payer_commission_is_reconciled(self):
+        topup, transaction_id = self.topup(amount=200_000)
+        self.responses[transaction_id].update(
+            status="CANCELED",
+            paymentDetails={"amount": 2160, "currency": "RUB"},
+            comission=160,
+            comissionType=1,
+        )
+        await self.iterate()
+        self.assertEqual(self.wallet.topup(topup.id).status, "CANCELED")
+        self.assertEqual(self.wallet.account(1001).balance_minor, 0)
+        self.assertEqual(self.payments.pending_checks(), [])
+
+    async def test_refund_with_payer_commission_reverses_only_the_credited_amount(self):
+        topup, transaction_id = self.topup()
+        self.responses[transaction_id].update(
+            paymentDetails={"amount": 1.08, "currency": "RUB"},
+            comission=0.08,
+            comissionType=1,
+        )
+        await self.iterate()
+        self.assertEqual(self.wallet.account(1001).balance_minor, 100)
+        self.responses[transaction_id]["status"] = "CHARGEBACKED"
+        self.payments.wake_check(transaction_id)
+        await self.iterate()
+        self.payments.wake_check(transaction_id)
+        await self.iterate()
+        self.assertEqual(self.wallet.topup(topup.id).status, "REFUNDED")
+        self.assertEqual(self.wallet.account(1001).balance_minor, 0)
+
     async def test_duplicate_callbacks_and_concurrent_checks_credit_once(self):
         topup, transaction_id = self.topup()
         await self.post_callback(transaction_id)
@@ -231,6 +335,97 @@ class PaymentProcessingTests(unittest.IsolatedAsyncioTestCase):
         await self.post_callback(transaction_id)
         await self.iterate()
         self.assertEqual(self.wallet.account(1001).balance_minor, MIN_TOPUP_MINOR)
+
+    async def test_callback_rejection_logs_source_without_addresses_or_sensitive_data(self):
+        web = await self.start_web()
+        with (
+            patch.object(self.client, "validate_callback", side_effect=PlategaError("sensitive-error")),
+            self.assertLogs("jopesvpn.bot", level="WARNING") as logs,
+        ):
+            response = await web.post(
+                "/platega/callback",
+                headers={
+                    "X-Secret": "sensitive-secret",
+                    "X-Forwarded-For": "198.51.100.1",
+                    "X-Real-IP": "198.51.100.1",
+                },
+                json={"private": "sensitive-payload"},
+            )
+        self.assertEqual(response.status, 401)
+        message = logs.records[0].getMessage()
+        self.assertRegex(message, r"\(source=[0-9a-f]{16}, error=PlategaError\)$")
+        for value in (
+            "sensitive-error", "sensitive-secret", "sensitive-payload",
+            "198.51.100.1", "127.0.0.1", self.settings.bot_token,
+        ):
+            self.assertNotIn(value, message)
+        self.assertEqual(self.payments.pending_checks(), [])
+
+    async def test_callback_source_identity_accepts_only_valid_trusted_proxy_addresses(self):
+        self.settings = replace(self.settings, platega_trusted_proxy_ip="127.0.0.1")
+        web = await self.start_web()
+        sources = {}
+        for address, expected in (
+            ("198.51.100.1", "198.51.100.1"),
+            ("2001:db8::1", "2001:db8::1"),
+            ("2001:0db8::1", "2001:db8::1"),
+            ("invalid-source", "127.0.0.1"),
+            ("198.51.100.1, 198.51.100.2", "127.0.0.1"),
+            ("", "127.0.0.1"),
+        ):
+            with self.subTest(address=address), self.assertLogs("jopesvpn.bot", level="WARNING") as logs:
+                response = await web.post(
+                    "/platega/callback",
+                    headers={"X-Secret": "wrong-secret", "X-Real-IP": address},
+                    json={"private": "sensitive-payload"},
+                )
+            self.assertEqual(response.status, 401)
+            message = logs.records[0].getMessage()
+            self.assertRegex(message, r"\(source=[0-9a-f]{16}, error=PlategaError\)$")
+            source = message.split("source=", 1)[1].split(",", 1)[0]
+            if expected in sources:
+                self.assertEqual(source, sources[expected])
+            else:
+                self.assertNotIn(source, sources.values())
+                sources[expected] = source
+            self.assertNotIn("wrong-secret", message)
+            self.assertNotIn("sensitive-payload", message)
+            self.assertNotIn(expected, message)
+            if address:
+                self.assertNotIn(address, message)
+        self.assertEqual(self.payments.pending_checks(), [])
+
+    async def test_late_stars_payment_keeps_payment_history_without_granting_access(self):
+        selected_plan = next(item for item in self.plans if item.sellable)
+        order = self.orders.create_order(
+            1001, selected_plan, selected_plan.term_for(7), now="2026-01-01T00:00:00Z"
+        )
+        self.orders.cancel_stale_pending(now="2026-01-02T00:00:00Z")
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1001),
+            successful_payment=SimpleNamespace(
+                invoice_payload=f"jvpay_{order.id}", telegram_payment_charge_id="late-stars-charge",
+                total_amount=order.amount_minor, currency=order.currency,
+            ),
+            answer=AsyncMock(),
+        )
+        for _ in range(2):
+            await process_stars_payment(
+                message, self.bot, self.panel, self.settings, self.plans, self.orders, self.wallet
+            )
+        confirmed = self.orders.get(order.id)
+        self.assertEqual(confirmed.status, FULFILLMENT_REVIEW)
+        self.assertEqual(confirmed.provider_payment_id, "late-stars-charge")
+        transaction = self.wallet.payment_transaction(order.id)
+        self.assertIsNotNone(transaction)
+        self.assertEqual(transaction.status, "REVIEW")
+        self.assertEqual(transaction.amount_paid_minor, order.amount_minor)
+        self.assertEqual(transaction.currency, "XTR")
+        self.panel.get_user_by_telegram_id.assert_not_awaited()
+        self.panel.create_user.assert_not_awaited()
+        self.panel.apply_paid_plan.assert_not_awaited()
+        self.bot.send_message.assert_awaited_once()
+        message.answer.assert_awaited_once()
 
     async def test_wrong_currency_and_payload_never_change_balance(self):
         _, transaction_id = self.topup()
@@ -380,6 +575,37 @@ class PaymentProcessingTests(unittest.IsolatedAsyncioTestCase):
                 "jopesvpn.bot._fulfill_order",
                 new=AsyncMock(return_value=SimpleNamespace()),
             ) as fulfill,
+            patch("jopesvpn.bot._payment_success_text", return_value="Paid"),
+        ):
+            await self.iterate()
+            self.payments.wake_check(transaction_id)
+            await self.iterate()
+        fulfill.assert_awaited_once()
+        self.assertEqual(self.orders.get(order.id).status, FULFILLED)
+        self.bot.send_message.assert_awaited_once()
+
+    async def test_subscription_with_payer_commission_fulfills_once(self):
+        plan = next(plan for plan in self.plans if plan.code == "lite-1")
+        term = plan.term_for(30)
+        order = self.orders.create_order(
+            1001, plan, term, provider="platega", payment_method=2
+        )
+        transaction_id = str(uuid4())
+        self.orders.save_payment_link(
+            order.id, transaction_id, "https://pay.example.test/order"
+        )
+        price = Decimal(order.amount_minor) / 100
+        commission = (price * Decimal("0.08")).quantize(Decimal("0.01"))
+        self.responses[transaction_id] = {
+            "id": transaction_id,
+            "status": "CONFIRMED",
+            "paymentDetails": {"amount": float(price + commission), "currency": "RUB"},
+            "payload": order.id,
+            "comission": float(commission),
+            "comissionType": 1,
+        }
+        with (
+            patch("jopesvpn.bot._fulfill_order", new=AsyncMock(return_value=SimpleNamespace())) as fulfill,
             patch("jopesvpn.bot._payment_success_text", return_value="Paid"),
         ):
             await self.iterate()

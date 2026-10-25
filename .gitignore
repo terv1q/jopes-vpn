@@ -9,6 +9,7 @@ deploy/production/.env.node
 
 # Internal project documentation, kept outside the public repository
 docs/
+OpenCode.md
 Политика-конфиденциальности.txt
 Пользовательское-соглашение.txt
 
@@ -35,6 +36,11 @@ htmlcov/
 *.db
 *.log
 .panel-index.tmp.js
+*.session
+*.session-journal
+bot_research/
+test.py
+*.rendered.json
 
 # Editors and operating system files
 .idea/

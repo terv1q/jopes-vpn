@@ -837,13 +837,16 @@ class WalletStore:
         if (
             order is None
             or int(order["telegram_id"]) != telegram_id
-            or order["status"] not in {"PAID", "FULFILLING", "FULFILLED"}
+            or order["status"] not in {
+                "PAID", "FULFILLING", "FULFILLED", "FULFILLMENT_REVIEW"
+            }
             or order["provider_payment_id"] != external_payment_id
             or order["rub_price_minor"] is None
             or int(order["amount_minor"]) != amount_paid_minor
             or str(order["currency"]).upper() != currency.upper()
         ):
             raise WalletConflict("Payment does not match order")
+        status = "REVIEW" if order["status"] == "FULFILLMENT_REVIEW" else "CONFIRMED"
         reference = f"order_payment:{order_id}"
         existing = connection.execute(
             "SELECT * FROM payment_transactions WHERE reference = ?",
@@ -859,10 +862,10 @@ class WalletStore:
             if existing["status"] == "PENDING":
                 connection.execute(
                     """
-                    UPDATE payment_transactions SET status = 'CONFIRMED', updated_at = ?
+                    UPDATE payment_transactions SET status = ?, updated_at = ?
                     WHERE reference = ? AND status = 'PENDING'
                     """,
-                    (_now(), reference),
+                    (status, _now(), reference),
                 )
             return
         self._record_transaction_locked(
@@ -874,7 +877,7 @@ class WalletStore:
             rub_amount_minor=int(order["rub_price_minor"]),
             method=method,
             purpose="subscription",
-            status="CONFIRMED",
+            status=status,
             reference=reference,
             external_payment_id=external_payment_id,
         )

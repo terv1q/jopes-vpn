@@ -13,3 +13,9 @@ tests
 docs
 config
 deploy
+*.session
+*.session-journal
+bot_research
+test.py
+OpenCode.md
+BOT_IMPROVEMENTS.md

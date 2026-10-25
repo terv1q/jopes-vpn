@@ -1,5 +1,7 @@
 # Jopes VPN production deployment (single Germany VPS)
 
+Production snapshot, 2026-10-24 (recorded in `OpenCode.md`): all eight containers are running; Telegram registers 65 handlers. Stars has three fulfilled orders from October 19–21, and Platega credited a real 1 ₽ top-up on October 24. Hysteria 2 is active on UDP 443 alongside TCP/REALITY 2053 and XHTTP/REALITY 8443. The setup instructions below describe initial provisioning; those services are already enabled on the existing VPS.
+
 This deployment is installed on the Germany VPS and was exercised there on 2026-10-17, but it remains an owner-operated single-VPS setup rather than a finished commercial service. It uses the exact Remnawave versions that passed the project's local Panel/Node integration test: Panel `3.4.5`, Node `3.4.2`, PostgreSQL `18.4`, Valkey `9.0.2`, and Caddy `2.10.2`; those infrastructure image digests are pinned in Compose. The bot image is based on the exact Python `3.13.15-slim-bookworm` tag, not a registry digest.
 
 Remnawave owns users, subscriptions, Nodes, and Xray configuration. The bot uses the Panel HTTPS API; it does not keep a second user database or edit Xray config. The Germany Node is the first direct VPN exit. The existing separate bridge/exit profiles remain the future topology; this deployment does not implement a bridge or whitelist circumvention.
@@ -22,7 +24,7 @@ Do not create `api.example.com`: there is no separate Jopes API. Do not create `
 - Node uses the official host-network Compose pattern. Panel has a static address `172.30.50.10` on the Compose bridge; its host gateway is `172.30.50.1`. Register the Node in Panel with address `172.30.50.1` and API port `2222`. Permit `2222/TCP` in UFW only from `172.30.50.10`; do not add a provider-firewall/public allow rule for it. Confirm both Panel-to-Node connectivity and external rejection of `2222` after deployment. If the host firewall does not enforce this source restriction with Docker's rules, stop and correct the firewall before operating; do not make the Node API public as a workaround.
 - The profile listens on `2053/TCP` so it does not conflict with Caddy's web `443/TCP`. The Panel Host must advertise `connect.example.com:2053` and map to `JOPES_EXIT_IN`.
 
-The Docker `data` network is marked internal. PostgreSQL has a named data volume. Valkey uses only a shared Unix socket volume for Panel/cache access and has no TCP listener or persistence; it is not an independent source of user data. Caddy certificate/account state and config use named volumes. The bot and ticket forum share the named volume `jopesvpn-production-bot-data`, mounted at `/app/data`; Panel remains the source of truth for accounts, subscriptions, and devices. Ticket messages, capability-token hashes, notification queue entries, and Telegram photo `file_id` values are stored in the same SQLite database. The forum is published only by Caddy under `https://connect.example.com/support`; its container has no host port. User links grant access to one ticket only. The administrator portal uses a separate password and signed, secure cookies. Web replies record the connecting IP, visible to the owner in the admin portal; source IPs are removed after 90 days, while ticket messages remain until the owner removes/backs up the database. Bot-originated replies have no client IP because Telegram does not provide it to the bot. Draft/reply prompts use in-memory FSM state and are lost on bot restart; saved ticket conversations persist. Do not use `docker compose down -v`.
+The Docker `data` network is marked internal. PostgreSQL has a named data volume. Valkey uses only a shared Unix socket volume for Panel/cache access and has no TCP listener or persistence; it is not an independent source of user data. Caddy certificate/account state and config use named volumes. The bot and ticket forum share the named volume `jopesvpn-production-bot-data`, mounted at `/app/data`; Panel remains the source of truth for accounts, subscriptions, and devices. Ticket messages, capability-token hashes, notification queue entries, and Telegram photo `file_id` values are stored in the same SQLite database. The forum is published only by Caddy under `https://connect.example.com/support`; its container has no host port. Users manage tickets in Telegram; `/support/t/...` is disabled. The administrator portal uses a separate password and signed, secure cookies. Web replies record the connecting IP, visible to the owner in the admin portal; source IPs are removed after 90 days, while ticket messages remain until the owner removes/backs up the database. Bot-originated replies have no client IP because Telegram does not provide it to the bot. Draft/reply prompts use in-memory FSM state and are lost on bot restart; saved ticket conversations persist. Do not use `docker compose down -v`.
 
 ## Before first boot
 
@@ -115,15 +117,21 @@ Run from `/opt/jopesvpn/deploy/production`. The `.env` file is required explicit
 
 Telegram Stars remains available for plan purchases and wallet top-ups. When both `PLATEGA_MERCHANT_ID` and `PLATEGA_SECRET` are configured, the plan and top-up screens additionally offer the documented one-off methods (SBP QR, ERIP, card, international, crypto, SberPay) without provider branding. The wallet minimum is 1 RUB, verified by creating an unpaid SBP invoice against the configured merchant. Top-up buttons contain their quoted amount and remain usable after navigation or a bot restart. Pending invoices are reused only for the same payment method and before their saved expiry.
 
-Set the callback URL in Platega's merchant settings to `https://<CONNECT_DOMAIN>/platega/callback`. Caddy forwards it to the bot over the private Compose network; reload Caddy after adding the route. The public probe is `https://<CONNECT_DOMAIN>/platega/healthz`. Authenticated callbacks are durably queued in SQLite and acknowledged immediately. A background worker checks the authenticated transaction-status API, verifies the payment ID, amount, currency and any supplied payload, then credits or fulfills once. Callback payload is optional, as documented. A missing or delayed callback is recovered by automatic polling every 10 seconds for recent invoices, with slower checks for older invoices and backoff after API errors. Users receive confirmation automatically, and the payment message is updated; manual checking is not part of the new payment keyboard.
+Set the callback URL in Platega's merchant settings to `https://<CONNECT_DOMAIN>/platega/callback`. Caddy forwards it to the bot over the private Compose network. Reload Caddy after editing its mounted configuration in place; when deployment replaces `Caddyfile`, recreate `remnawave-proxy` with `docker compose --env-file .env -f docker-compose.yml up -d --no-build --no-deps --force-recreate remnawave-proxy` so its file bind mount reads the replacement. The public probe is `https://<CONNECT_DOMAIN>/platega/healthz`. Authenticated callbacks are durably queued in SQLite and acknowledged immediately. A background worker checks the authenticated transaction-status API, verifies the payment ID, amount, currency and any supplied payload, then credits or fulfills once. Callback payload is optional, as documented. A missing or delayed callback is recovered by automatic polling every 10 seconds for recent invoices, with slower checks for older invoices and backoff after API errors. Users receive confirmation automatically, and the payment message is updated; manual checking is not part of the new payment keyboard.
+
+Caddy overwrites `X-Real-IP` with the connecting client address. The bot accepts that header only from `PLATEGA_TRUSTED_PROXY_IP`, which Compose sets to Caddy's reserved backend address `172.30.50.11`; other peers are identified by their socket address. Valid IPv4 and IPv6 addresses are normalized and converted to a source identifier with HMAC-SHA256 using the bot token. Rejection logs contain that identifier and the exception class, without raw addresses, request bodies, credentials or exception text. Rotating the bot token changes source identifiers. Applying this local change requires updating Compose and recreating both Caddy and the bot; a Caddy reload alone does not assign the reserved address. The standalone bot leaves proxy trust disabled by default.
+
+The API may return the service quote in `paymentDetails.amount` with a separate commission, as observed for pending crypto invoices, or a total including the payer fee. Reconciliation compares the immutable service quote with the API amount and, for `comissionType: 1`, its amount less the validated `comission`. Callback amounts must agree with the API amount using the same payer-fee metadata. Wallet credits, bonuses, refunds, subscription fulfillment and the confirmation screen use the stored service quote, while the payment form shows the final total with any payer fee.
 
 Payment checks and the notification outbox survive restarts in the shared SQLite volume. Telegram delivery errors retry independently of financial processing. Interrupted orders already marked paid can resume fulfillment; interrupted or uncertain Panel mutations go to the existing review workflow to avoid a duplicate extension. Admins can filter online transactions by status, check provider status, export a CSV, and confirm a refund request. The refund ledger waits for `CHARGEBACKED` verified through the API; callbacks and automatic polling both reconcile refunds. Repeated or out-of-order notifications cannot re-credit a refunded payment.
 
-This product currently sells prepaid terms; it does not silently enable automatic recurring renewals. Platega recurring subscriptions need separate opt-in, renewal/cancellation policy, and subscription-charge reconciliation. Payout API calls also require a dedicated payout secret and idempotency-key persistence; do not substitute `PLATEGA_SECRET` or enable payouts without those credentials and an explicitly approved payout workflow. No real Platega payment or refund was used for verification.
+This product currently sells prepaid terms; it does not silently enable automatic recurring renewals. Platega recurring subscriptions need separate opt-in, renewal/cancellation policy, and subscription-charge reconciliation. Payout API calls also require a dedicated payout secret and idempotency-key persistence; do not substitute `PLATEGA_SECRET` or enable payouts without those credentials and an explicitly approved payout workflow. A real 1 ₽ top-up was credited on October 24; refunds remain unverified.
 
 ## Subscription Page
 
 `remnawave-subscription-page` is a separate container (`remnawave/subscription-page:8.0.0`, digest pinned in Compose) on the `backend` network with no published port. Caddy serves it at the root of `connect.example.com`, so the page URL is `https://connect.example.com/<short_uuid>`. It cannot live under a path because its frontend assets are requested from `/assets`. The page host must be a host root; do not attach it to the Panel SPA host or share a path with it.
+
+Caddy serves HTTP/1.1 and HTTP/2 and sends `Alt-Svc: clear` on the Panel and connection hosts. UDP `443` belongs to Hysteria 2; its default HTTP fallback returns 404 when a browser follows a previously advertised HTTP/3 route. The Hysteria 2 inbound proxies those browser requests to the HTTPS connection host, allowing the page to load and the browser to clear its saved alternative route. Verify the rendered page and `/assets/.app-config-v2.json` in a normal browser with QUIC enabled, including a browser that opened the page before the change, since an HTTP-only command-line probe does not detect this conflict.
 
 Required environment values:
 
@@ -155,7 +163,9 @@ The profile uses VLESS + REALITY over `raw`/TCP with no Vision flow. Select REAL
 
 The pinned Node runs Xray `26.7.28`. Remnawave recognizes Hysteria 2 as the `hysteria` inbound protocol with version `2`, and derives each user's Hysteria credential from that user's managed UUID. Happ accepts Hysteria 2 links. This is an additional transport; it does not replace VLESS + REALITY or XHTTP.
 
-The production API token is intentionally read-scoped and cannot edit Config Profiles, Hosts, or Internal Squads. Use the Panel administrator UI to add `hysteria2-inbound.json` to the existing `Germany Exit` Config Profile, activate `JOPES_HYSTERIA2_IN` on `Germany-1`, create a Host for that inbound at `connect.arzhelper.tech:443`, and add the inbound to the existing `JOPES Direct` Internal Squad. Preserve the existing inbounds and settings. The Host must use TLS/SNI `connect.arzhelper.tech`. This grants Hysteria 2 to every user already in that squad.
+Use the Panel administrator UI or a maintenance API token authorized to update Config Profiles to add `hysteria2-inbound.json` to the existing `Germany Exit` Config Profile. Activate `JOPES_HYSTERIA2_IN` on `Germany-1`, create a Host for that inbound at `connect.arzhelper.tech:443`, and add the inbound to the existing `JOPES Direct` Internal Squad. Preserve the existing inbounds and settings. The Host must use TLS/SNI `connect.arzhelper.tech`. This grants Hysteria 2 to every user already in that squad.
+
+Set `streamSettings.hysteriaSettings.masquerade.url` to `https://<CONNECT_DOMAIN>` in the inbound template. The proxy uses Caddy over TCP with certificate verification and preserves the request path, so browsers with a saved HTTP/3 route can still load the subscription page while authenticated Hysteria 2 connections continue using the same listener.
 
 The Node reads a dedicated copy of Caddy's certificate, not Caddy's private-data volume. Copy the deployment files to `/opt/jopesvpn/deploy/production`, then run as the Docker-capable account:
 
@@ -281,32 +291,50 @@ docker compose --env-file .env -f docker-compose.yml --profile bot logs --tail=1
   docker compose --env-file .env -f docker-compose.yml start remnawave-proxy
   ```
 
-  Never back up into a web-served directory. Test restore to a separate instance or new VPS using a separate volume; do not overwrite the original production volume during a recovery attempt. A database dump and restore into a temporary database were tested on this VPS; off-host encrypted copies are not yet configured.
+  Never back up into a web-served directory. Test restore to a separate instance or new VPS using a separate volume; do not overwrite the original production volume during a recovery attempt. A full encrypted off-host backup and a PostgreSQL restore into an isolated temporary database were verified on 2026-10-25; see the Windows procedure below.
 - All Compose services use the `json-file` log driver with `max-size: 10m` and `max-file: 3`.
 - For reboot recovery, Docker's `unless-stopped` policy restarts the services and their named volumes persist. Verify `docker compose ps`, Panel health, Node status, certificate, and the external VPN check after reboot.
 - Never use `docker compose down -v` in routine updates or troubleshooting; it removes persistent state.
 
-## Off-host bot-state backup
+## Full off-host recovery backup and monitoring
 
-Run `offhost-backup.ps1` from a trusted Windows workstation with the existing `jopesvpn` SSH alias and OpenSSL available. The script takes a consistent SQLite online backup from the running bot container, streams it over SSH, encrypts it locally with AES-256-CBC/PBKDF2, authenticates the ciphertext with HMAC-SHA256, decrypts to a temporary file, and verifies `PRAGMA integrity_check` before retaining it. Encrypted snapshots and a DPAPI-protected key are stored under `%USERPROFILE%\JopesVPN-Backups`; plaintext temporary files are removed. The key is tied to the Windows user profile and must be included in that workstation's own protected backup to preserve recoverability.
+Run `offhost-backup.ps1 -FullBackup` from the trusted Windows workstation using the existing SSH alias. It exports a consistent SQLite online backup, a PostgreSQL custom dump, Caddy certificate/account data and deployment configuration, including both private environment files. No production service needs to stop. The archive is encrypted with AES-256-CBC/PBKDF2 and authenticated with HMAC-SHA256 before verification. Encrypted snapshots and the DPAPI-protected key are stored under `%USERPROFILE%\JopesVPN-Backups`, with access restricted to the current account. OpenSSL can be supplied with `-OpenSslPath`; the script also checks the Git for Windows installation.
 
-Run once and register a daily task in the current Windows user's interactive session:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\offhost-backup.ps1
-$action = New-ScheduledTaskAction -Execute "$PSHOME\powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$((Resolve-Path .\offhost-backup.ps1).Path)`""
-$trigger = New-ScheduledTaskTrigger -Daily -At 3am
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1)
-Register-ScheduledTask -TaskName JopesVPN-OffhostBackup -Action $action -Trigger $trigger -Settings $settings -Force
-```
-
-The workstation must be online and the user logged in for scheduled runs; review `%USERPROFILE%\JopesVPN-Backups\backup.log` and the Task Scheduler result. Restore only to a new local path for verification; the script refuses to overwrite an existing path:
+Verify a full backup and an isolated PostgreSQL restore, configure monitoring, then install the daily backup and five-minute monitoring tasks. Run these commands from `deploy/production`:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\offhost-backup.ps1 -RestoreFile "$env:USERPROFILE\JopesVPN-Backups\bot-state-<timestamp>.sqlite3.enc" -RestoreTo "$env:TEMP\jopesvpn-restore\bot-state.sqlite3"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\offhost-backup.ps1 -FullBackup -VerifyPostgresRestore
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\monitor.ps1 -Setup
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-operations-tasks.ps1
+Start-ScheduledTask -TaskName JopesVPN-OffhostBackup
+Start-ScheduledTask -TaskName JopesVPN-Monitor
+Get-ScheduledTaskInfo -TaskName JopesVPN-OffhostBackup
+Get-ScheduledTaskInfo -TaskName JopesVPN-Monitor
 ```
 
-This off-host job covers the bot SQLite database (billing, referrals, tickets, and bot state), not Panel PostgreSQL or Caddy certificate/account data. Keep those protected backups on a separate schedule and test their restore independently.
+`-VerifyPostgresRestore` restores the dump into a separate temporary database, checks that it has tables, then removes that database. It does not restore over the working Panel database. Every backup verifies archive hashes, SQLite integrity and archive paths; old SQLite-only snapshots remain supported. Keep the Windows user profile and its DPAPI key in protected workstation backups. The workstation must be on and the user logged in for these scheduled tasks; they are not a replacement for an always-on monitoring host. Review `backup.log`, `%USERPROFILE%\JopesVPN-Monitor\monitor.log` and Task Scheduler results.
+
+For a manual recovery rehearsal, restore only to a new protected path; the script refuses to overwrite files. A decrypted full archive contains secrets and must be removed after verification:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\offhost-backup.ps1 -RestoreFile "$env:USERPROFILE\JopesVPN-Backups\recovery-<timestamp>.tar.gz.enc" -RestoreTo "$env:USERPROFILE\JopesVPN-Backups\restore-check.tar.gz"
+```
+
+The monitor checks HTTPS bot readiness, Panel health, support authentication, all eight container states, available RAM, swap and the two VPN TCP listeners over SSH. Defaults require two consecutive failures/recoveries, at least 500 MiB available RAM and at most 75% swap use. Configure thresholds with `monitor.ps1 -Setup` arguments. Its configuration is protected with DPAPI; logs contain only status and aggregate resource measurements. Telegram notifications are disabled by default. Enable them only when the owner authorizes sending to `BOT_ADMIN_IDS`, using `monitor.ps1 -Setup -EnableTelegramAlerts`.
+
+The bot exposes `/healthz` on its existing internal port `8081`; Caddy publishes that route. Docker readiness depends on completed startup and a successful read-only Telegram `getMe` within `HEALTH_PROBE_MAX_AGE_SECONDS`. Probe frequency is `HEALTH_PROBE_INTERVAL_SECONDS`. Failures are deduplicated in logs; the route exposes status and uptime only.
+
+## Domain templates
+
+Set `APEX_DOMAIN`, `PANEL_DOMAIN`, `CONNECT_DOMAIN` and `TRIAL_CHANNEL_USERNAME` in the existing production environment file. Caddy uses those variables directly. Validate Compose with `config --quiet`; avoid printing expanded configuration because it contains secrets.
+
+The Hysteria inbound is a template. Render to a separate, ignored output before a future profile update:
+
+```bash
+python3 render-config.py --env-file .env --output hysteria2-inbound.rendered.json
+```
+
+Rendering validates the configured DNS host and refuses to overwrite either input. It does not update any live Panel profile. The certificate helper reads `CONNECT_DOMAIN` from `ENV_FILE`, with optional `CADDY_DATA_DIR` and `HYSTERIA2_CERT_DIR` overrides. Installing a changed helper under `/usr/local/sbin` needs the owner's sudo access; validate the script with `sh -n` before installation. Preserve the working certificate timer until that installation is complete.
 
 ## Validated vs pending
 

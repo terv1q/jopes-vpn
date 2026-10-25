@@ -5,7 +5,7 @@ import uuid
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from jopesvpn.plans import Plan, PlanTerm, term_savings
@@ -18,6 +18,8 @@ FULFILLING = "FULFILLING"
 FULFILLMENT_REVIEW = "FULFILLMENT_REVIEW"
 REFUNDING = "REFUNDING"
 REFUNDED = "REFUNDED"
+
+STALE_PENDING_TTL_MINUTES = 24 * 60
 
 
 class OrderError(Exception):
@@ -401,6 +403,9 @@ class OrderStore:
             if row is None:
                 raise OrderNotFound(order_id)
             order = _order(row)
+            cancelled_payment = order.status == CANCELLED and provider in {
+                "platega", "telegram_stars"
+            }
             if order.provider_payment_id is not None:
                 if (
                     order.provider == provider
@@ -419,16 +424,21 @@ class OrderStore:
                 if (
                     order.provider != provider
                     or order.provider_payment_id != provider_payment_id
-                    or (order.status != PENDING and not (provider == "platega" and order.status == CANCELLED))
+                    or (order.status != PENDING and not cancelled_payment)
                 ):
                     raise OrderConflict("Order already has another payment")
-            if order.status != PENDING and not (provider == "platega" and order.status == CANCELLED):
+            if order.status != PENDING and not cancelled_payment:
                 raise OrderStateError(f"Order is {order.status}")
             if order.provider is not None and order.provider != provider:
                 raise OrderConflict("Payment provider does not match the order")
             if amount_minor != order.amount_minor or currency.upper() != order.currency:
                 raise OrderConflict("Payment amount or currency does not match the order")
             paid_at = now or _now()
+            status = (
+                FULFILLMENT_REVIEW
+                if cancelled_payment and provider == "telegram_stars"
+                else PAID
+            )
             try:
                 connection.execute(
                     """
@@ -437,7 +447,7 @@ class OrderStore:
                     WHERE id = ? AND status = ?
                     """,
                     (
-                        PAID,
+                        status,
                         provider,
                         provider_payment_id,
                         paid_at,
@@ -619,3 +629,29 @@ class OrderStore:
             )
             connection.commit()
         return self.get(order_id)
+
+    def cancel_stale_pending(
+        self, *, ttl_minutes: int = STALE_PENDING_TTL_MINUTES, now: str | None = None
+    ) -> int:
+        if not 1 <= ttl_minutes <= 60 * 24 * 365:
+            raise ValueError("Stale order TTL is out of range")
+        current = datetime.fromisoformat(now or _now())
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        cutoff = current.astimezone(UTC) - timedelta(minutes=ttl_minutes)
+        try:
+            with closing(self._connect()) as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE orders SET status = ?
+                    WHERE status = ?
+                      AND provider_payment_id IS NULL
+                      AND julianday(created_at) <= julianday(?)
+                    """,
+                    (CANCELLED, PENDING, cutoff.isoformat()),
+                )
+                changed = cursor.rowcount
+                connection.commit()
+        except sqlite3.Error as error:
+            raise OrderError("Stale orders could not be cancelled") from error
+        return changed

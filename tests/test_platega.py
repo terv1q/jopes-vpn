@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import httpx
 
-from jopesvpn.platega import PlategaClient, PlategaError
+from jopesvpn.platega import PlategaClient, PlategaError, PlategaProtocolError
 
 
 class QueueTransport(httpx.AsyncBaseTransport):
@@ -100,6 +100,84 @@ class PlategaClientTests(unittest.IsolatedAsyncioTestCase):
                         "status": "CONFIRMED",
                     },
                 )
+        finally:
+            await client.close()
+
+    async def test_status_distinguishes_payer_and_merchant_commissions(self) -> None:
+        transaction_id = str(uuid4())
+        transport = QueueTransport(
+            {
+                "id": transaction_id,
+                "status": "CONFIRMED",
+                "paymentDetails": {"amount": 2160, "currency": "RUB"},
+                "comission": 160,
+                "comissionType": 1,
+            }
+        )
+        client = PlategaClient(str(uuid4()), "test-secret", transport=transport)
+        try:
+            status = await client.get_transaction_status(transaction_id)
+            self.assertEqual(status.amount, Decimal("2160"))
+            self.assertTrue(status.matches_service_amount(Decimal("2000")))
+            self.assertFalse(status.matches_service_amount(Decimal("2001")))
+            transport.response["comissionType"] = 0
+            status = await client.get_transaction_status(transaction_id)
+            self.assertTrue(status.matches_service_amount(Decimal("2160")))
+            self.assertFalse(status.matches_service_amount(Decimal("2000")))
+        finally:
+            await client.close()
+
+    async def test_separate_and_optional_fee_metadata_preserve_the_service_quote(self) -> None:
+        transaction_id = str(uuid4())
+        transport = QueueTransport(
+            {
+                "id": transaction_id,
+                "status": "CONFIRMED",
+                "paymentDetails": {"amount": 1, "currency": "RUB"},
+                "comission": 0.05,
+                "comissionType": 1,
+            }
+        )
+        client = PlategaClient(str(uuid4()), "test-secret", transport=transport)
+        try:
+            status = await client.get_transaction_status(transaction_id)
+            self.assertTrue(status.matches_service_amount(Decimal("1")))
+            self.assertTrue(status.matches_callback_amount(Decimal("1.05")))
+            transport.response["comission"] = 2
+            status = await client.get_transaction_status(transaction_id)
+            self.assertTrue(status.matches_service_amount(Decimal("1")))
+            self.assertTrue(status.matches_callback_amount(Decimal("3")))
+            del transport.response["comission"]
+            transport.response["paymentDetails"] = {"amount": 1.08, "currency": "RUB"}
+            status = await client.get_transaction_status(transaction_id)
+            self.assertFalse(status.matches_service_amount(Decimal("1")))
+            self.assertTrue(status.matches_service_amount(Decimal("1.08")))
+        finally:
+            await client.close()
+
+    async def test_invalid_commissions_cannot_be_used_to_validate_a_payment(self) -> None:
+        transaction_id = str(uuid4())
+        transport = QueueTransport({})
+        client = PlategaClient(str(uuid4()), "test-secret", transport=transport)
+        invalid_commissions = (
+            {"comissionType": 1, "comission": "invalid"},
+            {"comissionType": 1, "comission": -0.01},
+            {"comissionType": -1, "comission": 0.08},
+            {"comissionType": 1, "comission": float("nan")},
+            {"comissionType": True, "comission": 0.08},
+            {"comissionType": 1, "comission": True},
+        )
+        try:
+            for invalid in invalid_commissions:
+                with self.subTest(commission=invalid):
+                    transport.response = {
+                        "id": transaction_id,
+                        "status": "CONFIRMED",
+                        "paymentDetails": {"amount": 1.08, "currency": "RUB"},
+                        **invalid,
+                    }
+                    with self.assertRaises(PlategaProtocolError):
+                        await client.get_transaction_status(transaction_id)
         finally:
             await client.close()
 

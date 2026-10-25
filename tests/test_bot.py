@@ -1304,6 +1304,32 @@ class BotAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             settings = Settings.from_env(env_file="Z:\\missing\\no-dotenv-file")
         self.assertTrue(settings.free_access_enabled)
 
+    def test_platega_proxy_setting_requires_single_ip_address(self) -> None:
+        import os
+        from unittest.mock import patch
+
+        env = {
+            "BOT_TOKEN": "123:token",
+            "PANEL_API_URL": "https://panel.example.com",
+            "PANEL_API_TOKEN": "panel-token",
+            "BOT_ADMIN_IDS": "1001",
+        }
+        for address, expected in (
+            ("", None),
+            (" 172.30.50.11 ", "172.30.50.11"),
+            ("2001:0db8::1", "2001:db8::1"),
+        ):
+            with self.subTest(address=address), patch.dict(
+                os.environ, {**env, "PLATEGA_TRUSTED_PROXY_IP": address}, clear=True
+            ):
+                settings = Settings.from_env(env_file="Z:\\missing\\no-dotenv-file")
+                self.assertEqual(settings.platega_trusted_proxy_ip, expected)
+        for address in ("proxy.example.test", "172.30.50.11, 172.30.50.12", "172.30.50.0/24"):
+            with self.subTest(address=address), patch.dict(
+                os.environ, {**env, "PLATEGA_TRUSTED_PROXY_IP": address}, clear=True
+            ), self.assertRaises(ConfigurationError):
+                Settings.from_env(env_file="Z:\\missing\\no-dotenv-file")
+
     def test_settings_reject_panel_url_credentials(self) -> None:
         import os
         from unittest.mock import patch

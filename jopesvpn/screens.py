@@ -41,6 +41,7 @@ USER_BANNERS = {
     "profile": "purchase_success",
     "wallet": "cabinet",
     "topup": "plans",
+    "promo": "plans",
     "connect": "connect",
     "subscription": "purchase_success",
     "key": "purchase_success",

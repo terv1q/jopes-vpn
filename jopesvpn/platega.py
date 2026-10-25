@@ -45,6 +45,18 @@ class TransactionStatus:
     amount: Decimal
     currency: str
     payload: str | None = None
+    commission: Decimal = Decimal("0")
+    commission_type: int | None = None
+
+    def matches_service_amount(self, amount: Decimal) -> bool:
+        return self.amount == amount or (
+            self.commission_type == 1 and self.amount - self.commission == amount
+        )
+
+    def matches_callback_amount(self, amount: Decimal) -> bool:
+        return self.matches_service_amount(amount) or (
+            self.commission_type == 1 and self.amount + self.commission == amount
+        )
 
 
 def _https_url(value: str) -> bool:
@@ -252,12 +264,30 @@ class PlategaClient:
             raise PlategaProtocolError(
                 "Platega status amount is invalid"
             )
+        commission_type = data.get("comissionType")
+        commission = data.get("comission")
+        if commission_type is not None and (
+            isinstance(commission_type, bool)
+            or not isinstance(commission_type, int)
+            or commission_type < 0
+        ):
+            raise PlategaProtocolError("Platega commission type is invalid")
+        if commission is None:
+            parsed_commission = Decimal("0")
+        else:
+            if isinstance(commission, bool) or not isinstance(commission, (int, float)):
+                raise PlategaProtocolError("Platega commission is invalid")
+            parsed_commission = Decimal(str(commission))
+            if not parsed_commission.is_finite() or parsed_commission < 0:
+                raise PlategaProtocolError("Platega commission is invalid")
         return TransactionStatus(
             transaction_id=normalized_id,
             status=status,
             amount=parsed_amount,
             currency=currency.upper(),
             payload=data.get("payload") if isinstance(data.get("payload"), str) else None,
+            commission=parsed_commission,
+            commission_type=commission_type,
         )
 
     def validate_callback(

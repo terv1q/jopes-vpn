@@ -14,6 +14,9 @@ class PreferencesError(Exception):
 
 DOCUMENTS_VERSION = "1"
 
+FREE_DAILY_REPORT_MAX_ATTEMPTS = 3
+FREE_DAILY_REPORT_RETRY_SECONDS = 300
+
 
 class PreferencesStore:
     """Small persistent store for user-facing bot preferences.
@@ -254,6 +257,23 @@ class PreferencesStore:
                     )
                     """
                 )
+                report_columns = {
+                    row["name"]
+                    for row in connection.execute(
+                        "PRAGMA table_info(free_daily_reports)"
+                    ).fetchall()
+                }
+                for column, declaration in (
+                    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+                    ("last_attempt_at", "TEXT"),
+                    ("next_attempt_at", "TEXT"),
+                    ("abandoned_at", "TEXT"),
+                    ("abandon_reason", "TEXT"),
+                ):
+                    if column not in report_columns:
+                        connection.execute(
+                            f"ALTER TABLE free_daily_reports ADD COLUMN {column} {declaration}"
+                        )
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS traffic_notification_state (
@@ -1158,6 +1178,24 @@ class PreferencesStore:
             raise PreferencesError("Cannot read user preferences") from error
         return [int(row["telegram_id"]) for row in rows]
 
+    def free_access_users(self) -> list[int]:
+        try:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT telegram_id FROM user_preferences
+                    UNION
+                    SELECT telegram_id FROM free_daily_state
+                    UNION
+                    SELECT telegram_id FROM free_daily_reports
+                    WHERE sent_at IS NULL AND abandoned_at IS NULL
+                    ORDER BY telegram_id
+                    """
+                ).fetchall()
+        except sqlite3.Error as error:
+            raise PreferencesError("Cannot read free access users") from error
+        return [int(row["telegram_id"]) for row in rows]
+
     def free_daily_state(
         self, telegram_id: int
     ) -> tuple[str, int | None] | None:
@@ -1227,20 +1265,29 @@ class PreferencesStore:
                 raise PreferencesError("Free usage state could not be updated") from error
 
     def pending_free_daily_reports(
-        self, limit: int = 100
+        self, limit: int = 100, *, now: datetime | None = None
     ) -> list[tuple[int, str, int | None]]:
         if not 1 <= limit <= 1000:
             raise ValueError("Report limit is out of range")
+        current = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 """
                 SELECT telegram_id, report_day, used_bytes
                 FROM free_daily_reports
                 WHERE sent_at IS NULL
+                  AND abandoned_at IS NULL
+                  AND attempts < ?
+                  AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM bot_settings
+                      WHERE name = 'free_daily_reports_retry_at'
+                        AND julianday(value) > julianday(?)
+                  )
                 ORDER BY report_day, telegram_id
                 LIMIT ?
                 """,
-                (limit,),
+                (FREE_DAILY_REPORT_MAX_ATTEMPTS, current, current, limit),
             ).fetchall()
         return [
             (
@@ -1251,17 +1298,157 @@ class PreferencesStore:
             for row in rows
         ]
 
-    def mark_free_daily_report_sent(
-        self, telegram_id: int, report_day: str
+    def defer_free_daily_reports(
+        self, retry_after: int, *, now: datetime | None = None
     ) -> None:
+        if retry_after <= 0:
+            raise ValueError("Retry delay must be positive")
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO bot_settings (name, value)
+                    VALUES ('free_daily_reports_retry_at', ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        value = excluded.value, updated_at = datetime('now')
+                    WHERE julianday(excluded.value) > julianday(bot_settings.value)
+                    """,
+                    ((current + timedelta(seconds=retry_after)).isoformat(),),
+                )
+                connection.commit()
+        except sqlite3.Error as error:
+            raise PreferencesError("Free daily report retry delay could not be saved") from error
+
+    def record_free_daily_report_failure(
+        self,
+        telegram_id: int,
+        report_day: str,
+        *,
+        reason: str,
+        permanent: bool,
+        now: datetime | None = None,
+    ) -> tuple[int, bool]:
+        safe_reason = (reason or "unknown").strip()[:64] or "unknown"
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT attempts, abandoned_at FROM free_daily_reports
+                    WHERE telegram_id = ? AND report_day = ? AND sent_at IS NULL
+                    """,
+                    (telegram_id, report_day),
+                ).fetchone()
+                if row is None:
+                    connection.rollback()
+                    return 0, True
+                if row["abandoned_at"] is not None:
+                    connection.rollback()
+                    return int(row["attempts"]), True
+                attempts = int(row["attempts"]) + 1
+                abandoned = permanent or attempts >= FREE_DAILY_REPORT_MAX_ATTEMPTS
+                delay = FREE_DAILY_REPORT_RETRY_SECONDS * 2 ** (attempts - 1)
+                next_attempt = (
+                    None
+                    if abandoned
+                    else (current + timedelta(seconds=delay)).isoformat()
+                )
+                connection.execute(
+                    """
+                    UPDATE free_daily_reports
+                    SET attempts = ?,
+                        last_attempt_at = ?,
+                        next_attempt_at = ?,
+                        abandoned_at = CASE
+                            WHEN ? THEN ? ELSE abandoned_at
+                        END,
+                        abandon_reason = CASE WHEN ? THEN ? ELSE abandon_reason END
+                    WHERE telegram_id = ? AND report_day = ? AND sent_at IS NULL
+                    """,
+                    (
+                        attempts,
+                        current.isoformat(),
+                        next_attempt,
+                        int(abandoned),
+                        current.isoformat(),
+                        int(abandoned),
+                        safe_reason,
+                        telegram_id,
+                        report_day,
+                    ),
+                )
+                if permanent:
+                    connection.execute(
+                        """
+                        UPDATE free_daily_reports
+                        SET abandoned_at = ?, abandon_reason = ?, next_attempt_at = NULL
+                        WHERE telegram_id = ?
+                          AND sent_at IS NULL AND abandoned_at IS NULL
+                        """,
+                        (current.isoformat(), safe_reason, telegram_id),
+                    )
+                connection.commit()
+        except sqlite3.Error as error:
+            raise PreferencesError("Free daily report state could not be saved") from error
+        return attempts, abandoned
+
+    def abandon_free_daily_reports(self, telegram_id: int, reason: str) -> int:
+        safe_reason = (reason or "unknown").strip()[:64] or "unknown"
+        try:
+            with closing(self._connect()) as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE free_daily_reports
+                    SET abandoned_at = datetime('now'), abandon_reason = ?, next_attempt_at = NULL
+                    WHERE telegram_id = ?
+                      AND sent_at IS NULL
+                      AND abandoned_at IS NULL
+                    """,
+                    (safe_reason, telegram_id),
+                )
+                closed = cursor.rowcount
+                connection.commit()
+        except sqlite3.Error as error:
+            raise PreferencesError("Free daily reports could not be closed") from error
+        return closed
+
+    def purge_free_daily_state(self, telegram_id: int) -> None:
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "DELETE FROM free_daily_state WHERE telegram_id = ?",
+                    (telegram_id,),
+                )
+                connection.execute(
+                    """
+                    UPDATE free_daily_reports
+                    SET abandoned_at = datetime('now'), abandon_reason = 'not_free',
+                        next_attempt_at = NULL
+                    WHERE telegram_id = ? AND sent_at IS NULL AND abandoned_at IS NULL
+                    """,
+                    (telegram_id,),
+                )
+                connection.commit()
+        except sqlite3.Error as error:
+            raise PreferencesError("Free daily state could not be removed") from error
+
+    def mark_free_daily_report_sent(
+        self, telegram_id: int, report_day: str, *, now: datetime | None = None
+    ) -> None:
+        current = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with closing(self._connect()) as connection:
             connection.execute(
                 """
                 UPDATE free_daily_reports
-                SET sent_at = datetime('now')
-                WHERE telegram_id = ? AND report_day = ? AND sent_at IS NULL
+                SET sent_at = ?, attempts = attempts + 1, last_attempt_at = ?,
+                    next_attempt_at = NULL
+                WHERE telegram_id = ? AND report_day = ?
+                  AND sent_at IS NULL AND abandoned_at IS NULL
                 """,
-                (telegram_id, report_day),
+                (current, current, telegram_id, report_day),
             )
             connection.commit()
 
@@ -1464,7 +1651,7 @@ class PreferencesStore:
             return None
         try:
             parsed = urlsplit(value)
-            parsed.port
+            _ = parsed.port
             valid = (
                 parsed.scheme == "https"
                 and bool(parsed.hostname)
@@ -1492,7 +1679,7 @@ class PreferencesStore:
         if url is not None:
             try:
                 parsed = urlsplit(url)
-                parsed.port
+                _ = parsed.port
                 valid_url = (
                     len(url) <= 2048
                     and url.isascii()

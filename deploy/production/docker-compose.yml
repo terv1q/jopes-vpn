@@ -70,6 +70,8 @@ services:
       ACME_EMAIL: ${ACME_EMAIL}
       PANEL_DOMAIN: ${PANEL_DOMAIN}
       CONNECT_DOMAIN: ${CONNECT_DOMAIN}
+      APEX_DOMAIN: ${APEX_DOMAIN:?Set APEX_DOMAIN to the apex host}
+      TRIAL_CHANNEL_USERNAME: ${TRIAL_CHANNEL_USERNAME:-jopesvpn}
     ports:
       - "80:80/tcp"
       - "443:443/tcp"
@@ -88,6 +90,7 @@ services:
       start_period: 10s
     networks:
       backend:
+        ipv4_address: 172.30.50.11
         aliases:
           - ${PANEL_DOMAIN}
       ticket-web: {}
@@ -176,13 +179,34 @@ services:
       SUPPORT_CONTACT: ${SUPPORT_CONTACT:-}
       TRIAL_CHANNEL_USERNAME: ${TRIAL_CHANNEL_USERNAME:-jopesvpn}
       TRIAL_DAYS: ${TRIAL_DAYS:-3}
+      BRAND_NAME: ${BRAND_NAME:-Jopes VPN}
+      COMMUNITY_URL: ${COMMUNITY_URL-https://t.me/JopesVpnChat}
+      REVIEWS_URL: ${REVIEWS_URL-https://t.me/JopesVpnReviews}
+      RESOURCES_URL: ${RESOURCES_URL-https://t.me/addlist/cEJd4DRCx25kMmEy}
+      PROMO_MIN_CODE_LENGTH: ${PROMO_MIN_CODE_LENGTH:-8}
+      PROMO_MAX_CODE_LENGTH: ${PROMO_MAX_CODE_LENGTH:-48}
+      PROMO_MAX_ATTEMPTS: ${PROMO_MAX_ATTEMPTS:-5}
+      PROMO_GLOBAL_MAX_ATTEMPTS: ${PROMO_GLOBAL_MAX_ATTEMPTS:-300}
+      PROMO_ATTEMPT_WINDOW_SECONDS: ${PROMO_ATTEMPT_WINDOW_SECONDS:-900}
+      PROMO_MAX_REWARD_MINOR: ${PROMO_MAX_REWARD_MINOR:-100000}
+      PROMO_MAX_VALID_DAYS: ${PROMO_MAX_VALID_DAYS:-365}
+      PROMO_MAX_USES: ${PROMO_MAX_USES:-10000}
+      HEALTH_PROBE_INTERVAL_SECONDS: ${HEALTH_PROBE_INTERVAL_SECONDS:-60}
+      HEALTH_PROBE_MAX_AGE_SECONDS: ${HEALTH_PROBE_MAX_AGE_SECONDS:-180}
       ENABLE_TRAFFIC_PLANS: ${ENABLE_TRAFFIC_PLANS:-0}
       ENABLE_FREE_ACCESS: ${ENABLE_FREE_ACCESS:-0}
       SUBSCRIPTION_PAGE_URL: ${SUBSCRIPTION_PAGE_URL:-https://connect.example.com}
       TICKET_PORTAL_URL: ${TICKET_PORTAL_URL:-https://connect.example.com/support}
       PLATEGA_MERCHANT_ID: ${PLATEGA_MERCHANT_ID:-}
       PLATEGA_SECRET: ${PLATEGA_SECRET:-}
+      PLATEGA_TRUSTED_PROXY_IP: 172.30.50.11
       BOT_STATE_DB: /app/data/bot-state.sqlite3
+    healthcheck:
+      test: ["CMD", "python", "-m", "jopesvpn.health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     volumes:
       # Owner-editable tariffs; restart the bot after editing, no rebuild needed.
       - ../../jopesvpn/plans.json:/app/jopesvpn/plans.json:ro

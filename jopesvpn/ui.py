@@ -8,6 +8,11 @@ from urllib.parse import quote, urlsplit
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from jopesvpn.broadcasts import AUDIENCES, BroadcastDraft
+from jopesvpn.config import (
+    DEFAULT_COMMUNITY_URL,
+    DEFAULT_RESOURCES_URL,
+    DEFAULT_REVIEWS_URL,
+)
 from jopesvpn.i18n import (
     LANGUAGE_FLAGS,
     SUPPORTED_LANGUAGES,
@@ -272,16 +277,12 @@ def home_keyboard(
             )
         ],
     ]
-    if has_access:
-        rows.insert(
-            1,
-            [
-                InlineKeyboardButton(
-                    text=t("common.cabinet"),
-                    callback_data="user:cabinet",
-                )
-            ],
-        )
+    account_row = [
+        InlineKeyboardButton(text=t("common.cabinet"), callback_data="user:cabinet")
+    ]
+    if primary.callback_data != "user:plans":
+        account_row.append(InlineKeyboardButton(text=t("common.plans"), callback_data="user:plans"))
+    rows.insert(1, account_row)
     if is_admin:
         rows.append(
             [InlineKeyboardButton(text=t("admin.panel_button"), callback_data="admin:home")]
@@ -296,6 +297,7 @@ def more_keyboard() -> InlineKeyboardMarkup:
             [(t("common.devices"), "user:devices")],
             [(t("common.stats"), "user:stats")],
             [(t("common.plans"), "user:plans")],
+            [(t("promo.button"), "user:promo")],
             [(t("common.guides"), "user:guides")],
             [(t("common.about"), "user:about")],
             [(t("wallet.open_button"), "user:wallet")],
@@ -303,6 +305,7 @@ def more_keyboard() -> InlineKeyboardMarkup:
             [(t("common.settings"), "user:settings")],
             [(t("common.help"), "user:help")],
             [(t("common.back"), "user:back")],
+            [(t("common.menu"), "user:home")],
         ]
     )
 
@@ -338,8 +341,23 @@ def about_text(
 def about_keyboard(
     privacy_url: str | None,
     agreement_url: str | None,
+    *,
+    channel_url: str | None = None,
+    community_url: str | None = None,
+    reviews_url: str | None = None,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
+    resources = [
+        _url_button(t(label), url)
+        for label, url in (
+            ("common.channel", channel_url),
+            ("trial.button_community", community_url),
+            ("trial.button_reviews", reviews_url),
+        )
+        if url is not None
+    ]
+    if resources:
+        rows.append(resources)
     for label, url, document in (
         (t("docs.agreement_button"), agreement_url, "agreement"),
         (t("docs.privacy_button"), privacy_url, "privacy"),
@@ -622,6 +640,9 @@ def admin_documents_keyboard() -> InlineKeyboardMarkup:
 
 def cabinet_keyboard(page_url: str | None = None) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = [
+        [(t("common.connect"), "user:connect"), (t("common.plans"), "user:plans")],
+        [(t("common.devices"), "user:devices"), (t("common.settings"), "user:settings")],
+        [(t("promo.button"), "user:promo")],
         [(t("wallet.topup_button"), "user:topup")],
         [(t("wallet.open_button"), "user:wallet")],
         [(t("common.cooperation"), "user:referrals")],
@@ -766,6 +787,7 @@ def connect_keyboard(
             InlineKeyboardButton(text=t("common.menu"), callback_data="user:home"),
         ]
     )
+    rows.insert(-1, [InlineKeyboardButton(text=t("promo.button"), callback_data="user:promo")])
     rows.insert(
         -1,
         [
@@ -825,6 +847,7 @@ def plans_keyboard(
             )
         rows.extend(
             [
+                [InlineKeyboardButton(text=t("promo.button"), callback_data="user:promo")],
                 [
                     InlineKeyboardButton(
                         text=t("plans.button_how"), callback_data="user:guides"
@@ -1002,26 +1025,22 @@ def plans_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def trial_keyboard(channel_url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [_url_button(t("trial.button_channel"), channel_url)],
-            [
-                _url_button(
-                    t("trial.button_community"),
-                    "https://t.me/JopesVpnChat",
-                ),
-                _url_button(
-                    t("trial.button_reviews"),
-                    "https://t.me/JopesVpnReviews",
-                ),
-            ],
-            [
-                _url_button(
-                    t("trial.button_resources"),
-                    "https://t.me/addlist/cEJd4DRCx25kMmEy",
-                )
-            ],
+def trial_keyboard(
+    channel_url: str, *, community_url: str | None = DEFAULT_COMMUNITY_URL,
+    reviews_url: str | None = DEFAULT_REVIEWS_URL,
+    resources_url: str | None = DEFAULT_RESOURCES_URL,
+) -> InlineKeyboardMarkup:
+    rows = [[_url_button(t("trial.button_channel"), channel_url)]]
+    resources = [
+        _url_button(t(label), url)
+        for label, url in (("trial.button_community", community_url), ("trial.button_reviews", reviews_url))
+        if url is not None
+    ]
+    if resources:
+        rows.append(resources)
+    if resources_url is not None:
+        rows.append([_url_button(t("trial.button_resources"), resources_url)])
+    rows.extend([
             [
                 InlineKeyboardButton(
                     text=t("trial.button_check"), callback_data="trial:check"
@@ -1035,8 +1054,8 @@ def trial_keyboard(channel_url: str) -> InlineKeyboardMarkup:
                     text=t("common.menu"), callback_data="user:home"
                 ),
             ],
-        ]
-    )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def profile_keyboard() -> InlineKeyboardMarkup:
@@ -1066,6 +1085,9 @@ def help_keyboard(support: str | None = None) -> InlineKeyboardMarkup:
             )
         ],
     ]
+    rows.append([InlineKeyboardButton(text=t("common.about"), callback_data="user:about")])
+    if support:
+        rows.append([_url_button(t("common.support"), support)])
     rows.append(
         [
             InlineKeyboardButton(text=t("common.back"), callback_data="user:back"),
@@ -1226,6 +1248,7 @@ def wallet_text(
             "subscription_refund": "wallet.history_subscription_refund",
             "topup_bonus": "wallet.history_bonus",
             "balance_adjustment": "wallet.history_adjustment",
+            "promo_reward": "promo.history",
             "withdrawal": "wallet.history_withdrawal",
         }.get(payment.purpose, "wallet.history_adjustment")
         status_key = {
@@ -1240,6 +1263,7 @@ def wallet_text(
             "manual": "wallet.receipt_method_manual",
             "admin": "wallet.history_method_admin",
             "wallet_bonus": "wallet.history_method_bonus",
+            "promo_code": "promo.method",
         }.get(payment.method)
         method = t(method_key) if method_key is not None else escape(payment.method)
         history_rows.append(
@@ -1918,6 +1942,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
             [(t("docs.admin_menu"), "admin:docs")],
             [(t("admin.broadcast"), "admin:broadcasts")],
             [(t("admin.promo_posts"), "promo-builder:start")],
+            [(t("promo.admin_button"), "voucher:admin")],
             [(t("common.menu"), "user:home")],
         ]
     )
@@ -2663,7 +2688,7 @@ def home_text(
 
 
 def more_text() -> str:
-    return _heading(t("more.title"))
+    return _heading(t("more.title")) + "\n\n" + t("more.note")
 
 
 def cabinet_text(
@@ -2837,7 +2862,11 @@ def no_subscription_text(*, trial_available: bool = False) -> str:
     )
 
 
-def trial_text(trial_days: int, channel_url: str) -> str:
+def trial_text(
+    trial_days: int, channel_url: str, *,
+    community_url: str | None = DEFAULT_COMMUNITY_URL,
+    reviews_url: str | None = DEFAULT_REVIEWS_URL,
+) -> str:
     hours = trial_days * 24
     return "\n\n".join(
         [
@@ -2861,8 +2890,8 @@ def trial_text(trial_days: int, channel_url: str) -> str:
             t(
                 "trial.resources",
                 channel=f'<a href="{escape(channel_url, quote=True)}">{t("trial.resource_channel")}</a>',
-                community='<a href="https://t.me/JopesVpnChat">сообщество</a>',
-                reviews='<a href="https://t.me/JopesVpnReviews">отзывы</a>',
+                community=(f'<a href="{escape(community_url, quote=True)}">сообщество</a>' if community_url else "сообщество"),
+                reviews=(f'<a href="{escape(reviews_url, quote=True)}">отзывы</a>' if reviews_url else "отзывы"),
             ),
         ]
     )
@@ -3322,10 +3351,11 @@ def settings_text(
     )
 
 
-def help_text(support_contact: str | None = None) -> str:
+def help_text(support_contact: str | None = None, *, telegram_id: int | None = None) -> str:
     return "\n\n".join(
         [
             _heading(t("help.title")),
+            *([t("help.account_reference", telegram_id=telegram_id)] if telegram_id else []),
             _box(
                 t("help.sections"),
                 [

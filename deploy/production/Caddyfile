@@ -1,11 +1,15 @@
 {
 	admin localhost:2019
 	email {$ACME_EMAIL}
+	servers {
+		protocols h1 h2
+	}
 }
 
 {$PANEL_DOMAIN} {
 	encode zstd gzip
 	header {
+		Alt-Svc "clear"
 		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options "nosniff"
 		Referrer-Policy "no-referrer"
@@ -18,12 +22,19 @@
 {$CONNECT_DOMAIN} {
 	encode zstd gzip
 	header {
+		Alt-Svc "clear"
 		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options "nosniff"
 		Referrer-Policy "no-referrer"
 	}
 	@platega path /platega/callback /platega/healthz
 	handle @platega {
+		reverse_proxy bot:8081 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+	@bot_health path /healthz
+	handle @bot_health {
 		reverse_proxy bot:8081
 	}
 	@support path /support /support/*
@@ -35,12 +46,12 @@
 	# The subscription page only has per-subscription paths; its root has no
 	# content and the upstream aborts the request. Send visitors to the channel.
 	@root path /
-	redir @root https://t.me/jopesvpn 302
+	redir @root https://t.me/{$TRIAL_CHANNEL_USERNAME} 302
 	reverse_proxy remnawave-subscription-page:3010
 }
 
 # The apex and www names get publicly trusted certificates and redirect to the
 # Panel.
-example.com, www.example.com {
+{$APEX_DOMAIN}, www.{$APEX_DOMAIN} {
 	redir https://{$PANEL_DOMAIN}{uri} permanent
 }

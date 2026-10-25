@@ -6,7 +6,11 @@ import sqlite3
 from datetime import UTC, date, datetime, time, timedelta
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 
 from jopesvpn.config import Settings
 from jopesvpn.i18n import reset_language, set_language, t
@@ -18,17 +22,27 @@ from jopesvpn.panel import (
     RemnawaveClient,
 )
 from jopesvpn.preferences import PreferencesError, PreferencesStore
-from jopesvpn.ui import format_bytes
 from jopesvpn.timezones import format_datetime, reset_utc_offset, set_utc_offset
+from jopesvpn.ui import format_bytes
 
 logger = logging.getLogger(__name__)
+
+_PERMANENT_DELIVERY_MARKERS: tuple[tuple[str, str], ...] = (
+    ("bot was blocked", "blocked"),
+    ("bot was kicked", "kicked"),
+    ("chat not found", "chat_not_found"),
+    ("user is deactivated", "deactivated"),
+    ("peer_id_invalid", "invalid_peer"),
+    ("bot can't initiate conversation", "chat_not_found"),
+    ("user not found", "user_not_found"),
+)
 
 
 def _instant(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
     if parsed.tzinfo is None:
@@ -46,6 +60,23 @@ def _is_expired(user: PanelUser, now: datetime) -> bool:
     )
 
 
+def _delivery_failure(error: TelegramAPIError) -> tuple[str, bool]:
+    text = str(error).lower()
+    for marker, reason in _PERMANENT_DELIVERY_MARKERS:
+        if marker in text:
+            return reason, True
+    if isinstance(error, TelegramForbiddenError):
+        return "forbidden", True
+    return type(error).__name__[:64], False
+
+
+def _forget_free_state(prefs: PreferencesStore, telegram_id: int) -> None:
+    try:
+        prefs.purge_free_daily_state(telegram_id)
+    except (PreferencesError, sqlite3.Error):
+        logger.warning("FREE state cleanup failed")
+
+
 async def process_free_access_once(
     bot: Bot,
     panel: RemnawaveClient,
@@ -59,7 +90,7 @@ async def process_free_access_once(
     current = (now or datetime.now(UTC)).astimezone(UTC)
     current_day = current.date().isoformat()
     try:
-        telegram_ids = prefs.known_users()
+        telegram_ids = prefs.free_access_users()
     except (PreferencesError, sqlite3.Error):
         logger.warning("FREE account scan could not read known users")
         return
@@ -69,6 +100,7 @@ async def process_free_access_once(
         try:
             user = await panel.get_user_by_telegram_id(telegram_id)
         except PanelNotFound:
+            _forget_free_state(prefs, telegram_id)
             continue
         except PanelError as error:
             logger.warning("FREE account lookup failed (%s)", type(error).__name__)
@@ -89,7 +121,10 @@ async def process_free_access_once(
                 )
                 continue
 
-        if user.tag != "FREE" or user.status not in {"ACTIVE", "LIMITED"}:
+        if user.tag != "FREE":
+            _forget_free_state(prefs, telegram_id)
+            continue
+        if user.status not in {"ACTIVE", "LIMITED"}:
             continue
         try:
             if (
@@ -176,11 +211,16 @@ async def process_free_access_once(
         logger.warning("FREE daily reports are waiting for a confirmed Panel reset")
 
     try:
-        reports = prefs.pending_free_daily_reports()
+        reports = prefs.pending_free_daily_reports(
+            now=current if now is not None else datetime.now(UTC)
+        )
     except (PreferencesError, sqlite3.Error):
         logger.warning("FREE daily report queue could not be read")
         return
+    unreachable_users: set[int] = set()
     for telegram_id, report_day, used_bytes in reports:
+        if telegram_id in unreachable_users:
+            continue
         remaining = (
             max(FREE_TRAFFIC_BYTES - used_bytes, 0)
             if used_bytes is not None
@@ -207,9 +247,53 @@ async def process_free_access_once(
                 ),
                 parse_mode="HTML",
             )
-            prefs.mark_free_daily_report_sent(telegram_id, report_day)
-        except TelegramAPIError:
-            logger.warning("FREE daily report delivery failed")
+            prefs.mark_free_daily_report_sent(
+                telegram_id,
+                report_day,
+                now=current if now is not None else datetime.now(UTC),
+            )
+        except TelegramRetryAfter as error:
+            try:
+                prefs.defer_free_daily_reports(
+                    max(1, error.retry_after),
+                    now=current if now is not None else datetime.now(UTC),
+                )
+            except (PreferencesError, sqlite3.Error):
+                logger.warning("FREE daily report retry delay could not be saved")
+            else:
+                logger.debug("FREE daily reports paused for %s seconds", error.retry_after)
+            break
+        except TelegramAPIError as error:
+            reason, permanent = _delivery_failure(error)
+            if permanent:
+                unreachable_users.add(telegram_id)
+            try:
+                attempts, abandoned = prefs.record_free_daily_report_failure(
+                    telegram_id,
+                    report_day,
+                    reason=reason,
+                    permanent=permanent,
+                    now=current if now is not None else datetime.now(UTC),
+                )
+            except (PreferencesError, sqlite3.Error):
+                logger.warning("FREE daily report state could not be saved")
+                continue
+            if permanent:
+                logger.info("FREE daily reports closed: %s", reason)
+            elif abandoned:
+                logger.warning(
+                    "FREE daily report closed after %s attempt(s): %s",
+                    attempts,
+                    reason,
+                )
+            elif attempts == 1:
+                logger.warning(
+                    "FREE daily report delivery failed (%s), will retry", reason
+                )
+            else:
+                logger.debug(
+                    "FREE daily report attempt %s failed (%s)", attempts, reason
+                )
         except (PreferencesError, sqlite3.Error, ValueError):
             logger.warning("FREE daily report state could not be saved")
         finally:

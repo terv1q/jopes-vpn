@@ -10,6 +10,14 @@
   "streamSettings": {
     "network": "hysteria",
     "security": "tls",
+    "hysteriaSettings": {
+      "version": 2,
+      "masquerade": {
+        "type": "proxy",
+        "url": "https://{$CONNECT_DOMAIN}",
+        "rewriteHost": true
+      }
+    },
     "tlsSettings": {
       "alpn": [
         "h3"

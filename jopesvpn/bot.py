@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import logging
 import re
@@ -12,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from hashlib import sha256
 from html import escape
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -70,6 +72,7 @@ from jopesvpn.broadcasts import BroadcastError, BroadcastStore
 from jopesvpn.config import ConfigurationError, Settings
 from jopesvpn.connection_logs import connection_log_loop
 from jopesvpn.free_access import free_access_loop
+from jopesvpn.health import BotHealth
 from jopesvpn.i18n import (
     DEFAULT_LANGUAGE,
     SUPPORTED_LANGUAGES,
@@ -117,6 +120,17 @@ from jopesvpn.platega import (
     TransactionStatus,
 )
 from jopesvpn.preferences import PreferencesError, PreferencesStore
+from jopesvpn.promo_codes import PromoCodeError, PromoCodeStore
+from jopesvpn.promo_ui import (
+    PromoCodeFlow,
+    PromoInputExitMiddleware,
+    promo_admin_command,
+    promo_admin_help,
+    promo_cancel,
+    promo_code_input,
+    promo_command,
+    show_promo,
+)
 from jopesvpn.promotions import (
     PROMO_MAX_EXTRA_BUTTONS,
     PROMO_NEW_DAYS,
@@ -259,6 +273,14 @@ class PromoPostFlow(StatesGroup):
     awaiting_button_label = State()
     awaiting_button_url = State()
     awaiting_review_photo = State()
+
+
+router.message.register(promo_command, Command("promo"))
+router.message.register(promo_admin_command, Command("promo_create", "promo_disable"))
+router.message.register(promo_cancel, PromoCodeFlow.awaiting_code, Command("cancel"))
+router.message.register(promo_code_input, PromoCodeFlow.awaiting_code, F.text, ~F.text.startswith("/"))
+router.callback_query.register(promo_admin_help, F.data == "voucher:admin")
+router.callback_query.middleware(PromoInputExitMiddleware())
 
 
 @router.message(
@@ -1424,7 +1446,9 @@ async def show_about_command(
     settings: Settings,
     prefs: PreferencesStore | None = None,
     wallet: WalletStore | None = None,
+    state: FSMContext | None = None,
 ) -> None:
+    await _clear_state(state)
     if not _private_chat(message):
         await message.answer(t("alert.private_use_start"))
         return
@@ -1439,7 +1463,10 @@ async def show_about_command(
             free_access_enabled=settings.free_access_enabled,
             documents_configured=privacy_url is not None and agreement_url is not None,
         ),
-        about_keyboard(privacy_url, agreement_url),
+        about_keyboard(
+            privacy_url, agreement_url, channel_url=settings.trial_channel_url,
+            community_url=settings.community_url, reviews_url=settings.reviews_url,
+        ),
         banner="support",
     )
 
@@ -2406,7 +2433,10 @@ async def _user_screen(
                     privacy_url is not None and agreement_url is not None
                 ),
             ),
-            about_keyboard(privacy_url, agreement_url),
+            about_keyboard(
+                privacy_url, agreement_url, channel_url=settings.trial_channel_url,
+                community_url=settings.community_url, reviews_url=settings.reviews_url,
+            ),
         )
     elif screen in {"cabinet", "subscription"}:
         await callback.answer()
@@ -2733,7 +2763,7 @@ async def _user_screen(
         await callback.answer()
         await _edit_or_send(
             callback,
-            help_text(settings.support_contact),
+            help_text(settings.support_contact, telegram_id=callback.from_user.id),
             help_keyboard(support_url(settings.support_contact)),
         )
     elif screen == "troubleshoot":
@@ -2797,8 +2827,14 @@ async def _show_trial(
         return
     await _edit_or_send(
         callback,
-        trial_text(settings.trial_days, settings.trial_channel_url),
-        trial_keyboard(settings.trial_channel_url),
+        trial_text(
+            settings.trial_days, settings.trial_channel_url,
+            community_url=settings.community_url, reviews_url=settings.reviews_url,
+        ),
+        trial_keyboard(
+            settings.trial_channel_url, community_url=settings.community_url,
+            reviews_url=settings.reviews_url, resources_url=settings.resources_url,
+        ),
     )
 
 
@@ -3507,7 +3543,7 @@ async def help_command(
     _record_navigation(prefs, message.from_user.id, "help")
     await answer_screen(
         message,
-        help_text(settings.support_contact),
+        help_text(settings.support_contact, telegram_id=message.from_user.id),
         help_keyboard(support_url(settings.support_contact)),
         banner="support",
     )
@@ -3642,6 +3678,7 @@ async def user_navigation(
         "troubleshoot",
         "timezone",
         "languages",
+        "promo",
     }
     valid_action = (
         action == "back"
@@ -3681,13 +3718,17 @@ async def user_navigation(
     if callback.message is None or callback.message.chat.type != "private":
         await callback.answer(t("alert.private_chat"), show_alert=True)
         return
+    if not action.startswith(("dev:del:", "dev:rm:")):
+        await _clear_state(state)
     if prefs is not None:
         try:
             if action == "back":
                 action = prefs.pop_navigation(callback.from_user.id)
+                if action.startswith("dev:"):
+                    action = "devices"
             elif action == "home":
                 prefs.reset_navigation(callback.from_user.id)
-            elif not action.startswith(("set:", "languages:")):
+            elif not action.startswith(("set:", "languages:", "dev:")):
                 navigation_screen = (
                     "devices"
                     if action.startswith("devices:")
@@ -3701,6 +3742,11 @@ async def user_navigation(
             if action == "back":
                 action = "home"
 
+    if action == "back":
+        action = "home"
+    if action == "promo":
+        await show_promo(callback, settings, state)
+        return
     if action.startswith(("dev:del:", "dev:rm:")):
         if action.startswith("dev:del:"):
             await _confirm_device_delete(callback, panel, action, state)
@@ -4890,7 +4936,10 @@ async def _run_trial(
             f"<b>{t('trial.channel_missing_title')}</b>\n\n"
             f"{t('alert.trial_channel_missing_channel', channel=escape(channel_title()))}\n\n"
             f"{t('trial.channel_missing_note')}",
-            trial_keyboard(settings.trial_channel_url),
+            trial_keyboard(
+                settings.trial_channel_url, community_url=settings.community_url,
+                reviews_url=settings.reviews_url, resources_url=settings.resources_url,
+            ),
         )
         return
 
@@ -5461,6 +5510,13 @@ async def payment_review_loop(
     interval_seconds: int = 60,
 ) -> None:
     while True:
+        try:
+            expired = orders.cancel_stale_pending()
+        except (OrderError, sqlite3.Error):
+            logger.warning("Stale order cleanup failed")
+        else:
+            if expired:
+                logger.info("Cancelled %s stale pending order(s)", expired)
         try:
             pending = orders.pending_review_notifications()
         except (OrderError, sqlite3.Error):
@@ -6788,7 +6844,13 @@ async def process_stars_payment(
                 )
             ),
         )
-        if not changed or order.status != PAID:
+        if not changed:
+            return
+        if order.status == FULFILLMENT_REVIEW:
+            await _notify_payment_admins(bot, settings, order.id)
+            await message.answer(t("plans.paid_review"))
+            return
+        if order.status != PAID:
             return
         if wallet is None:
             raise WalletError("Payment history is unavailable")
@@ -6929,13 +6991,6 @@ async def _process_topup_payment(
         logger.warning("Top-up referral notification delivery failed")
 
 
-def _platega_minor_units(amount: Decimal) -> int:
-    minor = amount * 100
-    if not amount.is_finite() or minor != minor.to_integral_value():
-        raise PlategaProtocolError("Platega amount has unsupported precision")
-    return int(minor)
-
-
 async def _apply_platega_status(
     payment: TransactionStatus,
     *,
@@ -6961,13 +7016,18 @@ async def _apply_platega_status(
             payments=payments,
         )
         if result != "pending":
+            target = wallet.topup_by_payment_id(payment.transaction_id) or orders.get_by_payment_id(
+                payment.transaction_id, provider="platega"
+            )
+            if target is None:
+                raise PlategaProtocolError("Verified Platega payment is missing")
             payments.queue_screen(
                 payment.transaction_id,
                 result,
                 t(
                     "payments.status_screen",
                     status=t(f"platega.status_{result}"),
-                    amount=format_rubles(_platega_minor_units(payment.amount)),
+                    amount=format_rubles(target.amount_minor),
                     payment_id=escape(payment.transaction_id),
                 ),
             )
@@ -7073,7 +7133,7 @@ async def _apply_platega_status_locked(
             ) from None
     if (
         payment.currency != "RUB"
-        or _platega_minor_units(payment.amount) != expected_minor
+        or not payment.matches_service_amount(Decimal(expected_minor) / 100)
     ):
         raise PlategaProtocolError("Platega amount or currency does not match")
     if topup is not None and topup.provider_payment_id is None:
@@ -7262,7 +7322,7 @@ async def _verify_platega_status(
     actual = await client.get_transaction_status(callback_status.transaction_id)
     if (
         actual.transaction_id != callback_status.transaction_id
-        or actual.amount != callback_status.amount
+        or not actual.matches_callback_amount(callback_status.amount)
         or actual.currency != callback_status.currency
         or (
             callback_status.payload is not None
@@ -7503,17 +7563,39 @@ def _platega_web_application(
 
     async def callback_handler(request: web.Request) -> web.Response:
         try:
+            source = str(ip_address(request.remote or ""))
+        except ValueError:
+            source = "unknown"
+        if (
+            settings.platega_trusted_proxy_ip is not None
+            and source == settings.platega_trusted_proxy_ip
+        ):
+            try:
+                source = str(ip_address(request.headers.get("X-Real-IP", "")))
+            except ValueError:
+                pass
+        source_id = hmac.digest(
+            settings.bot_token.encode(),
+            f"platega.callback:{source}".encode(),
+            "sha256",
+        ).hex()[:16]
+        try:
             body = await request.json()
             payment = client.validate_callback(request.headers, body)
         except (PlategaProtocolError, ValueError, web.HTTPBadRequest):
+            logger.info("Platega callback payload rejected (source=%s)", source_id)
             raise web.HTTPBadRequest(text="Invalid payment callback") from None
-        except PlategaError:
-            logger.warning("Platega callback validation failed")
+        except PlategaError as error:
+            logger.warning(
+                "Platega callback validation failed (source=%s, error=%s)",
+                source_id,
+                type(error).__name__,
+            )
             raise web.HTTPUnauthorized(text="Invalid payment callback") from None
         try:
             payments.request_check(payment)
         except sqlite3.Error:
-            logger.warning("Platega callback could not be persisted")
+            logger.warning("Platega callback could not be persisted (source=%s)", source_id)
             raise web.HTTPServiceUnavailable(text="Payment queue unavailable") from None
         return web.Response(status=200)
 
@@ -7925,6 +8007,13 @@ async def main() -> None:
         await panel.close()
         await bot.session.close()
         raise SystemExit(2) from error
+    try:
+        promo_codes = PromoCodeStore(wallet, settings.promo_policy)
+    except PromoCodeError as error:
+        logger.error("Cannot start without voucher storage")
+        await panel.close()
+        await bot.session.close()
+        raise SystemExit(2) from error
     platega = (
         PlategaClient(settings.platega_merchant_id, settings.platega_secret)
         if settings.platega_enabled
@@ -7942,6 +8031,11 @@ async def main() -> None:
         await bot.session.close()
         raise SystemExit(2) from error
     platega_runner: web.AppRunner | None = None
+    health = BotHealth(
+        interval=settings.health_probe_interval_seconds,
+        max_age=settings.health_probe_max_age_seconds,
+    )
+    health_task = asyncio.create_task(health.probe(bot), name="telegram-health-probe")
     platega_payment_task: asyncio.Task | None = None
     payment_notice_task: asyncio.Task | None = None
     configure_screens(prefs)
@@ -7995,9 +8089,13 @@ async def main() -> None:
                 client=platega,
                 payments=payments,
             )
-            platega_runner = web.AppRunner(platega_app, access_log=None)
-            await platega_runner.setup()
-            await web.TCPSite(platega_runner, "0.0.0.0", 8081).start()
+        else:
+            platega_app = web.Application(client_max_size=65_536)
+        platega_app.router.add_get("/healthz", health.handler)
+        platega_runner = web.AppRunner(platega_app, access_log=None)
+        await platega_runner.setup()
+        await web.TCPSite(platega_runner, "0.0.0.0", 8081).start()
+        if platega is not None:
             platega_payment_task = asyncio.create_task(
                 platega_payment_loop(
                     bot=bot,
@@ -8029,11 +8127,14 @@ async def main() -> None:
                 BotCommand(command="referrals", description="Приглашения"),
                 BotCommand(command="cooperation", description="Сотрудничество"),
                 BotCommand(command="about", description="О сервисе"),
+                BotCommand(command="promo", description="Активировать промокод"),
                 BotCommand(command="paysupport", description="Помощь с оплатой"),
                 BotCommand(command="help", description="Помощь"),
             ]
         )
         await bot.get_me()
+        health.record_success()
+        health.ready = True
         await dispatcher.start_polling(
             bot,
             panel=panel,
@@ -8044,6 +8145,7 @@ async def main() -> None:
             promotions=promotions,
             orders=orders,
             wallet=wallet,
+            promo_codes=promo_codes,
             broadcasts=broadcasts,
             platega=platega,
             payments=payments,
@@ -8053,6 +8155,8 @@ async def main() -> None:
         logger.error("Telegram API operation failed (%s)", type(error).__name__)
         raise SystemExit(1) from None
     finally:
+        health.ready = False
+        health_task.cancel()
         reminder_task.cancel()
         connection_task.cancel()
         ticket_followup_task.cancel()
@@ -8067,6 +8171,7 @@ async def main() -> None:
         if payment_notice_task is not None:
             payment_notice_task.cancel()
         for task in (
+            health_task,
             reminder_task,
             trial_nudge_task,
             connection_task,

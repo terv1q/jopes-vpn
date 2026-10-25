@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -12,6 +13,45 @@ from dotenv import load_dotenv
 
 class ConfigurationError(ValueError):
     pass
+
+
+DEFAULT_COMMUNITY_URL = "https://t.me/JopesVpnChat"
+DEFAULT_REVIEWS_URL = "https://t.me/JopesVpnReviews"
+DEFAULT_RESOURCES_URL = "https://t.me/addlist/cEJd4DRCx25kMmEy"
+
+
+@dataclass(frozen=True)
+class PromoPolicy:
+    min_code_length: int = 8
+    max_code_length: int = 48
+    max_attempts: int = 5
+    global_max_attempts: int = 300
+    attempt_window_seconds: int = 900
+    max_reward_minor: int = 100_000
+    max_valid_days: int = 365
+    max_uses: int = 10_000
+
+    def __post_init__(self) -> None:
+        if (
+            not 4 <= self.min_code_length <= self.max_code_length <= 64
+            or not 1 <= self.max_attempts <= self.global_max_attempts <= 100_000
+            or not 1 <= self.attempt_window_seconds <= 86_400
+            or not 1 <= self.max_reward_minor <= 100_000_000
+            or not 1 <= self.max_valid_days <= 3650
+            or not 1 <= self.max_uses <= 1_000_000
+        ):
+            raise ConfigurationError("Invalid promo code limits")
+
+    @classmethod
+    def from_env(cls) -> PromoPolicy:
+        defaults = cls()
+        try:
+            return cls(**{
+                name: int(os.environ.get(f"PROMO_{name.upper()}", str(value)))
+                for name, value in vars(defaults).items()
+            })
+        except ValueError as error:
+            raise ConfigurationError("PROMO limits must be valid integers") from error
 
 
 @dataclass(frozen=True)
@@ -34,6 +74,14 @@ class Settings:
     owner_telegram_id: int | None = None
     platega_merchant_id: str | None = None
     platega_secret: str | None = None
+    platega_trusted_proxy_ip: str | None = None
+    brand_name: str = "Jopes VPN"
+    community_url: str | None = DEFAULT_COMMUNITY_URL
+    reviews_url: str | None = DEFAULT_REVIEWS_URL
+    resources_url: str | None = DEFAULT_RESOURCES_URL
+    promo_policy: PromoPolicy = PromoPolicy()
+    health_probe_interval_seconds: int = 60
+    health_probe_max_age_seconds: int = 180
 
     @property
     def platega_enabled(self) -> bool:
@@ -85,7 +133,7 @@ class Settings:
         if require_panel:
             try:
                 parsed_panel_url = urlsplit(panel_api_url)
-                parsed_panel_url.port
+                _ = parsed_panel_url.port
             except ValueError as error:
                 raise ConfigurationError("PANEL_API_URL is invalid") from error
             if (
@@ -184,7 +232,7 @@ class Settings:
         if subscription_page_url is not None:
             try:
                 parsed_page_url = urlsplit(subscription_page_url)
-                parsed_page_url.port
+                _ = parsed_page_url.port
             except ValueError as error:
                 raise ConfigurationError("SUBSCRIPTION_PAGE_URL is invalid") from error
             if (
@@ -207,7 +255,7 @@ class Settings:
         if ticket_portal_url is not None:
             try:
                 parsed_ticket_url = urlsplit(ticket_portal_url)
-                parsed_ticket_url.port
+                _ = parsed_ticket_url.port
             except ValueError as error:
                 raise ConfigurationError("TICKET_PORTAL_URL is invalid") from error
             if (
@@ -243,6 +291,45 @@ class Settings:
                     "TICKET_PORTAL_URL is required for Platega callbacks"
                 )
 
+        trusted_proxy_ip = os.environ.get("PLATEGA_TRUSTED_PROXY_IP", "").strip() or None
+        if trusted_proxy_ip is not None:
+            try:
+                trusted_proxy_ip = str(ip_address(trusted_proxy_ip))
+            except ValueError as error:
+                raise ConfigurationError("PLATEGA_TRUSTED_PROXY_IP must be an IP address") from error
+
+        brand_name = os.environ.get("BRAND_NAME", "Jopes VPN").strip()
+        if not brand_name or len(brand_name) > 64 or any(ord(c) < 32 for c in brand_name):
+            raise ConfigurationError("BRAND_NAME must contain 1 to 64 printable characters")
+        resource_urls = {}
+        for name, default in (
+            ("community_url", DEFAULT_COMMUNITY_URL),
+            ("reviews_url", DEFAULT_REVIEWS_URL),
+            ("resources_url", DEFAULT_RESOURCES_URL),
+        ):
+            value = os.environ.get(name.upper(), default).strip() or None
+            if value is not None:
+                try:
+                    parsed = urlsplit(value)
+                    _ = parsed.port
+                except ValueError as error:
+                    raise ConfigurationError(f"{name.upper()} is invalid") from error
+                if (
+                    parsed.scheme != "https" or not parsed.hostname
+                    or parsed.username is not None or parsed.password is not None
+                    or len(value) > 2048 or any(c.isspace() or ord(c) < 32 for c in value)
+                ):
+                    raise ConfigurationError(f"{name.upper()} must be an HTTPS URL")
+            resource_urls[name] = value
+
+        try:
+            health_interval = int(os.environ.get("HEALTH_PROBE_INTERVAL_SECONDS", "60"))
+            health_max_age = int(os.environ.get("HEALTH_PROBE_MAX_AGE_SECONDS", "180"))
+        except ValueError as error:
+            raise ConfigurationError("HEALTH_PROBE limits must be integers") from error
+        if not 5 <= health_interval <= 3600 or not 2 * health_interval <= health_max_age <= 86400:
+            raise ConfigurationError("Invalid HEALTH_PROBE interval or maximum age")
+
         return cls(
             bot_token=bot_token,
             panel_api_url=panel_api_url,
@@ -262,4 +349,10 @@ class Settings:
             owner_telegram_id=owner_id,
             platega_merchant_id=merchant_id,
             platega_secret=platega_secret,
+            platega_trusted_proxy_ip=trusted_proxy_ip,
+            brand_name=brand_name,
+            promo_policy=PromoPolicy.from_env(),
+            health_probe_interval_seconds=health_interval,
+            health_probe_max_age_seconds=health_max_age,
+            **resource_urls,
         )
