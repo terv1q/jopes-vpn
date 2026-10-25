@@ -226,7 +226,8 @@ async def check_once(
         ):
             raise ValueError("Control payment identity mismatch")
         if topup.status == "REFUNDED":
-            store.state(topup.id, "refunded")
+            # The wallet also retires unpaid stale invoices with this status.
+            store.state(topup.id, "refunded" if topup.paid_at else "expired")
             continue
         if topup.status != "CREDITED" or not topup.provider_payment_id:
             created = datetime.fromisoformat(topup.created_at).replace(tzinfo=UTC)

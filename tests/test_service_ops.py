@@ -274,6 +274,21 @@ class PolicyTests(unittest.TestCase):
 
 
 class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retired_unpaid_invoice_is_expired_not_a_confirmed_refund(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state"
+            wallet = WalletStore(path)
+            topup = wallet.create_topup(
+                1, 100, 1, now=(datetime.now(UTC) - timedelta(minutes=31)).isoformat()
+            )
+            store = PaymentCheckStore(path)
+            store.add(topup.id, "telegram_stars", 1, 100)
+            wallet.create_topup(1, 100, 1)
+            bot = AsyncMock()
+            await check_once(bot, settings(), wallet, None, store)
+            self.assertEqual(store.rows()[0]["state"], "expired")
+            bot.refund_star_payment.assert_not_called()
+
     async def test_service_commands_bypass_existing_fsm_and_unknown_command(self):
         from jopesvpn.bot import (
             TicketFlow,
